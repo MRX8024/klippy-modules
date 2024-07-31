@@ -8,6 +8,7 @@ import numpy as np
 import matplotlib.pyplot as plt, matplotlib.ticker as ticker
 from textwrap import wrap
 from datetime import datetime
+from . import input_shaper
 
 MEASURE_DELAY = 0.10        # Delay between damped oscillations and measurement
 MEASURE_SPEED = 200         # mm/s
@@ -29,11 +30,13 @@ class ResonanceAnalyser:
         self.gcode_move = self.printer.load_object(config, 'gcode_move')
         self.force_move = self.printer.load_object(config, 'force_move')
         self.stepper_en = self.printer.load_object(config, 'stepper_enable')
+        self.input_shaper = self.printer.load_object(config, 'input_shaper')
+        # self.input_shaper_conf = input_shaper.AxisInputShaper(self.config)
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         # Read config
         self.accel_chip = self.config.get('accel_chip')
         self.chip_config = self.printer.lookup_object(self.accel_chip)
-        self.max_repeats = self.config.getint('repeats', default=1, minval=1, maxval=100)
+        self.repeats = self.config.getint('repeats', default=1, minval=1, maxval=100)
         self.debug = self.config.getboolean('debug', default=False)
         # Register commands
         self.gcode.register_command('RESONANCE_ANALYSE', self.cmd_RUN_ANALYZE, desc='Start resonance analyzing')
@@ -44,7 +47,7 @@ class ResonanceAnalyser:
         self.travel_speed = self.toolhead.max_velocity / 2
         self.travel_accel = self.toolhead.max_accel
         self.travel_dist = MEASURE_SPEED ** 2 / self.travel_accel + 20
-        self.travel_dir = 1
+        # self.input_shaper = self.printer.lookup_object('input_shaper')
 
     def lookup_config(self, section, section_entries, force_back=None):
         out = []
@@ -68,6 +71,7 @@ class ResonanceAnalyser:
 
     def _init_axes(self):
         axes_columns = {}
+        self.toolhead.dwell(1.00)
         for axis in ['Z', 'X', 'Y']:
             aclient = self.chip_config.start_internal_client()
             self.toolhead.dwell(0.025)
@@ -96,18 +100,19 @@ class ResonanceAnalyser:
 
     def _resonance_move(self):
         # extra_axis = (ax if ax != axis else '' for ax in self.axes)
-        x, y = self.axes
-        ctx = self.center[x]
-        cty = self.center[y]
-        inset = self.travel_dist / 2
-        speed = MEASURE_SPEED * 60
-        moves = [
-            f'G0 {x}{ctx - inset} {y}{cty - inset} F{speed}',
-            f'G0 {x}{ctx + inset} {y}{cty - inset} F{speed}',
-            f'G0 {x}{ctx + inset} {y}{cty + inset} F{speed}',
-            f'G0 {x}{ctx - inset} {y}{cty + inset} F{speed}']
-        for _ in range(self.max_repeats):
-            for move in moves:
+        # x, y = self.axes
+        # ctx = self.center[x]
+        # cty = self.center[y]
+        # inset = self.travel_dist / 2
+        # speed = MEASURE_SPEED * 60
+        # moves = [
+        #     f'G0 {x}{ctx - inset} {y}{cty - inset} F{speed}',
+        #     f'G0 {x}{ctx + inset} {y}{cty - inset} F{speed}',
+        #     f'G0 {x}{ctx + inset} {y}{cty + inset} F{speed}',
+        #     f'G0 {x}{ctx - inset} {y}{cty + inset} F{speed}']
+        for i in range(self.repeats):
+            # self.moves.reverse()
+            for move in self.moves:
                 self._send(str(move))
 
     def _peak_rangecut(self, xy_vect, size=50, tolerance=5000):
@@ -137,6 +142,8 @@ class ResonanceAnalyser:
 
     def _measure(self):
         # Measure the impact
+        self._send(f'G0 X67.76 Y167.24 F{MEASURE_SPEED * 60}')
+        self.toolhead.dwell(self.delay)
         aclient = self.chip_config.start_internal_client()
         self.toolhead.dwell(self.delay)
         self._resonance_move()
@@ -160,14 +167,20 @@ class ResonanceAnalyser:
                    f"F{self.travel_speed * 60}")
         self._send(f'SET_VELOCITY_LIMIT ACCEL={self.travel_accel} MINIMUM_CRUISE_RATIO=0 SQUARE_CORNER_VELOCITY=5')
         self.toolhead.wait_moves()
-        self.toolhead.dwell(1.00)
     
     def cmd_RUN_ANALYZE(self, gcmd):
+        # type = gcmd.get('SHAPER_TYPE', '')
+        #
+        # for shaper in self.input_shaper.shapers:
+        #     shaper.shaper_type = type
+        # # self.input_shaper_conf.report(gcmd)
+        #
+        # return
         self.axes = ['X', 'Y']
         self.motion = {}
         # Live variables
         self.axes = gcmd.get('AXES', self.axes)
-        self.max_repeats = gcmd.get_int('REPEATS', self.max_repeats, minval=1, maxval=100)
+        self.repeats = gcmd.get_int('REPEATS', self.repeats, minval=1, maxval=100)
         self.travel_dist = gcmd.get_int('DIST', self.travel_dist, minval=1, maxval=100)
         self.delay = gcmd.get_float('DELAY', MEASURE_DELAY, minval=0, maxval=100)
         freq_start = gcmd.get_int("FREQ_START", 20, minval=1.)
@@ -175,6 +188,7 @@ class ResonanceAnalyser:
         step = gcmd.get_float('STEP', 5, minval=1, maxval=10)
         self.travel_accel = gcmd.get_int('ACCEL', self.travel_accel, minval=1000, maxval=999999)
         self.travel_dist = MEASURE_SPEED ** 2 / self.travel_accel + 20
+        shaper = gcmd.get('SHAPER_TYPE', '')
         # Run
         self._homing()
         axes_columns = self._init_axes()
@@ -183,11 +197,56 @@ class ResonanceAnalyser:
         for axis in self.axes:
             data[axis] = {}
         coeff = 10
-        for type in ['shaper_type_x', 'shaper_type']:
-            shaper = self.lookup_config('input_shaper', [type], 0)
-            if shaper: break
+
+        if not shaper:
+            for type in ['shaper_type_x', 'shaper_type']:
+                shaper = self.lookup_config('input_shaper', [type], 0)
+                if shaper: break
         if not shaper:
             raise self.gcode.error('Unknown shaper type')
+
+        #################################################
+        # aclient = self.chip_config.start_internal_client()
+        # self.toolhead.dwell(self.delay)
+        self.moves = [
+            'G0 X67.76 Y167.24',
+            'G0 X67.76 Y143.732',
+            'G0 X67.918 Y143.732',
+            'G0 X72.76 Y147.122',
+            'G0 X72.76 Y139.672',
+            'G0 X67.918 Y143.062',
+            'G0 X67.76 Y143.062',
+            'G0 X67.76 Y104.109',
+            'G0 X72.76 Y100.608',
+            'G0 X72.76 Y92.838',
+            'G0 X67.76 Y89.337',
+            'G0 X67.76 Y67.76',
+            'G0 X91.268 Y67.76',
+            'G0 X91.268 Y67.918',
+            'G0 X87.921 Y72.699',
+            'G0 X87.878 Y72.76',
+            'G0 X95.328 Y72.76',
+            'G0 X91.938 Y67.918',
+            'G0 X91.938 Y67.76',
+            'G0 X130.891 Y67.76',
+            'G0 X134.392 Y72.76',
+            'G0 X142.162 Y72.76',
+            'G0 X145.663 Y67.76',
+            'G0 X167.24 Y67.76',
+        ]
+        # for move in moves:
+        #     self._send(str(move))
+        # self.toolhead.dwell(self.delay)
+        # aclient.finish_measurements()
+        # vect = np.array([[sample.time, sample.accel_x, sample.accel_y, sample.accel_z]
+        #                  for sample in aclient.get_samples()])
+        # with open('log.txt', 'w') as file:
+        #     for i in vect:
+        #             msg = f'[{i[0]}, {i[1]}, {i[2]}],'
+        #             file.write(str(msg) + '\n')
+        # return
+        #################################################
+
         freq_range = range(freq_start * coeff, int(freq_end * coeff + step * coeff), int(step * coeff))
         for freq in freq_range:
             freq /= coeff
@@ -202,7 +261,8 @@ class ResonanceAnalyser:
             #     return
             for axis in self.axes:
                 column = axes_columns[axis] + 1 # Skip time column
-                peak_point = np.mean(np.sort(np.abs(vect[:, column]))[-self.max_repeats * 4 * 2 * 4:]) # square + decel * 2
+                # peak_point = np.mean(np.sort(np.abs(vect[:, column]))[-self.repeats * 4 * 2 * 2:]) # square + decel * 2
+                peak_point = np.mean(np.sort(np.abs(vect[:, column]))[-self.repeats * 5 * 2:])
                 fil_xy_vect = self._peak_rangecut(vect[:, [0, column]])
                 # peak_point = np.abs(fil_xy_vect[:, 1:]).max()
                 oscill_time = float(fil_xy_vect[-1, 0])
@@ -268,6 +328,6 @@ def plotter(x_data, y_data, axes, accel_chip, shaper, debug=False):
     else:
         check_export_path(RESULTS_FOLDER)
         now = datetime.now().strftime('%Y%m%d_%H%M%S')
-        png_path = os.path.join(RESULTS_FOLDER, f'interactive_plot_{accel_chip}_{now}.png')
+        png_path = os.path.join(RESULTS_FOLDER, f'interactive_plot_{shaper}_{accel_chip}_{now}.png')
         plt.savefig(png_path, dpi=500)
         return f'Access to interactive plot at: {png_path}'
