@@ -21,10 +21,7 @@ class VisionPos:
                          [0, 1032.9971, 535.9386],
                          [0, 0, 1]])
         self.dist_coeffs = np.array([0.0218, -0.0496, -0.0018, 0.0001, 0.0188])
-        self.T = np.array([[9.05647898e-01, 3.77814000e-01, 9.54179307e-01, -1.22963166e+02],
-                          [1.41144070e-01, 8.81989661e-01, 4.56316442e+00, -1.27373612e+03],
-                          [2.11589354e-17, 4.00721123e-16, 9.73179870e-16, 5.00000000e+00],
-                          [-3.55574532e-18, -1.69135539e-17, -4.33680869e-17, 1.00000000e+00]])
+        self.T = np.array([[]])
         self.linear_coeffs = np.array([
             [[-170.40, 194.77], [-176.20, 127.07], [100, 400]],
             [[10, 345], [288, 13], [0, 200]]])
@@ -48,21 +45,17 @@ class VisionPos:
         #     'The shape of primary and secondary points must match'
         # assert primary_points.shape[0] >= 4, \
         #     'At least 4 points are required for calibration'
-
         num_points = primary_points.shape[0]
         prime_points_homogeneous = np.hstack([primary_points, np.ones((num_points, 1))])
         sec_points_homogeneous = np.hstack([secondary_points, np.ones((num_points, 1))])
-
         T, _, _, _ = np.linalg.lstsq(prime_points_homogeneous, sec_points_homogeneous, rcond=None)
-
-        return T.T
+        return T
 
     def trans_coords(self, x, points):
-        points_homogeneous = np.hstack([points, np.ones((len(points), 1))])
-        real_points_homogeneous = points_homogeneous @ x
-        real_points = real_points_homogeneous[:, :3] / real_points_homogeneous[:, 3][:, np.newaxis]
-
-        return real_points
+        homo_points = np.hstack([points, np.ones((len(points), 1))])
+        real_homo_points = homo_points @ x
+        real_points = real_homo_points[:, :3] / real_homo_points[:, 3][:, np.newaxis]
+        return real_points[0]
 
     def interpol_coords(self, coords, toohead, cam):
         return [np.interp(coords[i], toohead[i], cam[i]) for i in range(len(coords))]
@@ -119,8 +112,8 @@ class VisionPos:
                         center = [int((c[0][0] + c[2][0]) / 2), int((c[0][1] + c[2][1]) / 2)]
                         cv.circle(frame, center, 5, (0, 0, 255), -1)
                         coords_text = f'{tvec[0][0][0]:.2f}, {tvec[0][0][1]:.2f}, {tvec[0][0][2]:.2f}'
-                        real_coords = self.interpol_coords(np.array(tvec[0][0]), *self.linear_coeffs)
-                        # real_coords = self.trans_coords(self.T, np.array([tvec[0][0]]))
+                        # real_coords = self.interpol_coords(np.array(tvec[0][0]), *self.linear_coeffs)
+                        real_coords = self.trans_coords(self.T, np.array([tvec[0][0]]))
                         real_coords_text = f'X{real_coords[0]:.2f}, Y{real_coords[1]:.2f}, Z{real_coords[2]:.2f}'
 
                         cv.putText(frame, coords_text, (center[0] + 25, center[1] - 30),
@@ -149,7 +142,7 @@ class VisionPos:
         cv.destroyAllWindows()
 
 klass = VisionPos()
-klass.track()
+# klass.track()
 
 # x, y = klass.linear_coeffs
 
@@ -157,16 +150,20 @@ klass.track()
 # x = klass.line_trans_coords(primary_coords, *klass.linear_coeffs)
 
 
-# prime = np.array([[9.02, 81.50, 274.06],
-#                  [9.46, -136.75, 360.06],
-#                  [-125.49, -54.56, 332.46],
-#                  [91.31, -54.28, 325.70]])
-# sec = np.array([[177.50, 50, 5],
-#                [177.50, 250, 5],
-#                [60, 177.50, 5],
-#                [250, 177.50, 5]])
-# T = klass.calibrate(prime, sec)
-# print(str(T))
+prime = np.array([[9.02, 81.50, 274.06],
+                 [9.46, -136.75, 360.06],
+                 [-125.49, -54.56, 332.46],
+                 [91.31, -54.28, 325.70]])
+sec = np.array([[177.50, 50, 5],
+               [177.50, 250, 5],
+               [60, 177.50, 5],
+               [250, 177.50, 5]])
+T = klass.calibrate(prime, sec)
+print(str(T))
+# print(str(''))
+# print(str(T.T))
+klass.T = T
+klass.track()
 
 # prime = np.array([[9.02, 81.50, 274.06]])
 # sec = np.array([[177.50, 50, 5]])
