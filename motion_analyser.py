@@ -7,6 +7,7 @@
 
 import time, math, re
 import numpy as np
+from tqdm import tqdm
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.cm import ScalarMappable
@@ -273,34 +274,42 @@ def circle(polygons=100, radius=15, x_center=0, y_center=0):
     y_coords = radius * np.sin(thetas) + y_center
     return np.column_stack((x_coords, y_coords))
 
-def parse_gcode(gcode, arc):
-    pos = []
+def parse_gcode(gcode, arc_convert):
+    z = 0.
+    coords = {}
     arcs = []
-    pattern = r'^G1\s+X([-+]?\d*\.?\d+)\s+Y([-+]?\d*\.?\d+)'
-    arc_pattern = (r'(G[23])\s+X([-+]?\d*\.?\d+)\s+Y([-+]?\d*'
-                   r'\.?\d+)(?:\s+I([-+]?\d*\.?\d+))?(?:\s+J('
-                   r'[-+]?\d*\.?\d+))?(?:\s*E([-+]?\d*\.?\d*))?')
-    for line in gcode:
-        match = re.search(pattern, line)
+    z_pattern = re.compile(r'^G1\s+Z([-+]?\d*\.?\d+)')
+    g1_pattern = re.compile(r'^G1\s+(?:F[-+]?\d*\.?\d+\s+)'
+                            r'?X([-+]?\d*\.?\d+)\s+Y([-+]?\d*\.?\d+)')
+    arc_pattern = re.compile(r'(G[23])\s+X([-+]?\d*\.?\d+)\s+Y([-+]?\d*\.?\d+)'
+                             r'(?:\s+I([-+]?\d*\.?\d+))?(?:\s+J([-+]?\d*\.?\d+))?')
+    for line in tqdm(gcode, desc='\033[97mParsing GCode'):
+        z_match = re.search(z_pattern, line)
+        if z_match:
+            z = float(z_match.group(1))
+            continue
+        g1_match = re.search(g1_pattern, line)
+        if g1_match:
+            if z not in coords:
+                coords[z] = []
+            coords[z].append([float(g1_match.group(1)),
+                              float(g1_match.group(2))])
+            continue
         arc_match = re.search(arc_pattern, line)
-        if match:
-            pos.append([float(match.group(1)),
-                        float(match.group(2))])
-        elif arc_match:
+        if arc_match:
             command = arc_match.group(1)
-            x, y = pos[-1]
+            x, y = coords[z][-1]
             x1 = float(arc_match.group(2))
             y1 = float(arc_match.group(3))
             i = float(arc_match.group(4)) if arc_match.group(4) else 0.
             j = float(arc_match.group(5)) if arc_match.group(5) else 0.
             arcs.append([i, j])
-            clockwise = True if command == 'G2' else False
-            arc_pos = arc.G2(i=i, j=j, x=x1, y=y1, old_x=x, old_y=y, clockwise=clockwise)
-            for i in arc_pos[:-1]:
-                pos.append(i)
-    return np.array(pos), np.array(arcs)
+            clockwise = command == 'G2'
+            arc_pos = arc_convert.G2(i=i, j=j, x=x1, y=y1, old_x=x, old_y=y, clockwise=clockwise)
+            coords[z].extend(arc_pos[:-1])
+    return coords, np.array(arcs)
 
-def main(path='', max_velocity=500, max_accel=10000, mcr=0.5, scv=5.0):
+def main(path='C:/Users/nikit/Downloads/Telegram Desktop/SC_ArcLowres.gcode', max_velocity=500, max_accel=15000, mcr=0.5, scv=5.0):
     global avgspeed
     if not path:
         path = input('Enter the path to the gcode file: ')
@@ -313,37 +322,41 @@ def main(path='', max_velocity=500, max_accel=10000, mcr=0.5, scv=5.0):
     #     toolhead.move(coord, 500)
     #     if _ % 100 == 1:
     #         print(f"Progress: {_ / (polygons / 100)}%")
-
     with open(path, 'r') as file:
         lines = file.readlines()
     moves, arcs = parse_gcode(lines, arc)
     # lenn = round(moves.shape[0] / 2.05)
     # moves = moves[lenn:-lenn]
-    print(f'\nTotal arcs: {arcs.shape[0]}')
-    print(f'Total polygons: {moves.shape[0]}')
-    mean_pos = moves.mean(axis=0)
-    toolhead.set_position(mean_pos)
-    for _, coord in enumerate(moves):
-        toolhead.move(coord, 500)
-        # if _ % 10000 == 1:
-        #     print(f"Progress: {_ / (polygons / 100):.2f}%")
-    toolhead.flush_lookahead()
+    print(f'Total arcs: {arcs.shape[0]}')
+    print(f'Total polygons: {len([pos for mas in moves.values() for pos in mas])}')
+    flushed_moves = {}
+    for layer in moves:
+        toolhead.lookahead.output = []
+        toolhead.set_position(moves[layer][0])
+        for _, coord in enumerate(moves[layer]):
+            toolhead.move(coord, 500)
+            # if _ % 10000 == 1:
+            #     print(f"Progress: {_ / (polygons / 100):.2f}%")
+        toolhead.flush_lookahead()
+        # flushed_moves.append(toolhead.lookahead.output)
+        flushed_moves[layer] = toolhead.lookahead.output
     # cruise_spd = (sum(avgspeed[len(avgspeed) // 5:-len(avgspeed) // 5])
     #               / len(avgspeed[len(avgspeed) // 5:-len(avgspeed) // 5]))
     avg_spd = avgspeed.mean()
     print(f"Total time: {time.perf_counter() - start_tm:.3f}")
-    msg = (f'Max Speed: {toolhead.max_velocity} mm/s\n'
-           f'Acceleration: {toolhead.max_accel} mm/s²\n'
-           f'Square Corner Velocity: {toolhead.square_corner_velocity} mm/s\n'
-           f'Min Cruise Ratio: {toolhead.min_cruise_ratio}\n'
+    msg = (f'Max Speed: {max_velocity} mm/s\n'
+           f'Acceleration: {max_accel} mm/s²\n'
+           f'Min Cruise Ratio: {mcr}\n'
+           f'Square Corner Velocity: {scv} mm/s\n'
            f'Average Speed: {avg_spd:.2f} mm/s')
     print(msg + '\n')
     # create = input('Create a plot? ').lower()
     # if create in ['y', 'yes']:
-    flushed_moves = toolhead.lookahead.output
-    plot(flushed_moves, max_velocity, max_accel, mcr, scv, avg_spd)
+    # plot(flushed_moves, max_velocity, max_accel, mcr, scv, avg_spd)
+    plot_3d(flushed_moves, max_velocity, max_accel, mcr, scv, avg_spd)
 
-def plot(flushed_moves, max_velocity, max_accel, min_cruise_ratio, square_corner_velocity, avg_spd):
+def plot(flushed_moves, max_velocity, max_accel, min_cruise_ratio,
+         square_corner_velocity, avg_spd):
     fig, ax = plt.subplots(figsize=(14, 14), facecolor='#f4f4f4')
     ax.set_xlabel('X, mm', fontsize=14, labelpad=10, color='#333333')
     ax.set_ylabel('Y, mm', fontsize=14, labelpad=10, color='#333333')
@@ -380,6 +393,48 @@ def plot(flushed_moves, max_velocity, max_accel, min_cruise_ratio, square_corner
     cbar.ax.yaxis.set_tick_params(color='#333333')
     ax.autoscale()
     ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.show()
+    print('Plot was created')
+
+def plot_3d(flushed_moves, max_velocity, max_accel, min_cruise_ratio,
+         square_corner_velocity, avg_spd, max_points=2):
+    fig = plt.figure(figsize=(14, 14))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_xlabel('X, mm', fontsize=14, labelpad=10, color='#333333')
+    ax.set_ylabel('Y, mm', fontsize=14, labelpad=10, color='#333333')
+    ax.set_zlabel('Z, mm', fontsize=14, labelpad=10, color='#333333')
+    moves_max_velocity = np.floor(
+        max(max(spd[1][0], spd[1][1]) for layer in flushed_moves.values() for spd in layer))
+    norm = Normalize(vmin=0, vmax=moves_max_velocity)
+    cmap = plt.get_cmap('plasma')
+    print('Graph generation')
+    for _, (z_value, moves) in enumerate(flushed_moves.items(), start=1):
+        for move in tqdm(moves, leave=False, desc=f'Processing layer {_} of {len(flushed_moves)}'):
+            color_start, color_end = move[1] / moves_max_velocity
+            [x1, y1], [x2, y2] = move[0]
+            x = np.linspace(x1, x2, max_points)
+            y = np.linspace(y1, y2, max_points)
+            gradient_colors = np.linspace(color_start, color_end, max_points)
+            colors = cmap(gradient_colors)[:, :3]
+            for i in range(len(x) - 1):
+                ax.plot([x[i], x[i + 1]], [y[i], y[i + 1]], [z_value, z_value], color=colors[i], lw=5)
+    print('Wait')
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    cbar = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02, aspect=30, shrink=0.8)
+    cbar.locator = ticker.MaxNLocator(nbins=10)
+    cbar.set_label('Speed, mm/s', fontsize=12, color='#333333')
+    cbar.ax.yaxis.set_tick_params(color='#333333')
+    plt.figtext(0.5, 0.04,
+                f'Max Speed: {max_velocity} mm/s | '
+                f'Acceleration: {max_accel} mm/s² | '
+                f'Min Cruise Ratio: {min_cruise_ratio} | '
+                f'Square Corner Velocity: {square_corner_velocity} mm/s | '
+                f'Average Speed: {avg_spd:.2f} mm/s',
+                ha='center', fontsize=12,
+                bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 10}, color='#000000')
+    ax.autoscale()
+    ax.set_zlim(0, max(flushed_moves.keys()) * 1)
     plt.tight_layout()
     plt.show()
     print('Plot was created')
