@@ -13,6 +13,7 @@ from matplotlib.collections import LineCollection
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
 from matplotlib import ticker
+from mpl_toolkits.mplot3d.art3d import Line3DCollection
 
 # Enum
 ARC_PLANE_X_Y = 0
@@ -166,7 +167,7 @@ class Move:
         cruise_t = cruise_d / cruise_v
         decel_t = decel_d / ((end_v + cruise_v) * 0.5)
         full_t = accel_t + cruise_t + decel_t
-        avgspeed = np.append(avgspeed, self.move_d / full_t)
+        avgspeed.append(self.move_d / full_t)
         accel_move = split_move(self.start_pos, self.end_pos, full_t, 0, full_t * accel_d / self.move_d)
         cruise_move = split_move(self.start_pos, self.end_pos, full_t, full_t * accel_d / self.move_d, full_t * (accel_d + cruise_d) / self.move_d)
         decel_move = split_move(self.start_pos, self.end_pos, full_t, full_t * (accel_d + cruise_d) / self.move_d, full_t)
@@ -274,11 +275,13 @@ def circle(polygons=100, radius=15, x_center=0, y_center=0):
     y_coords = radius * np.sin(thetas) + y_center
     return np.column_stack((x_coords, y_coords))
 
-def parse_gcode(gcode, arc_convert):
+def parse_gcode(gcode):
     z = 0.
+    old_z = 0.
     coords = {}
+    coords[z] = []
     arcs = []
-    z_pattern = re.compile(r'^G1\s+Z([-+]?\d*\.?\d+)')
+    z_pattern = re.compile(r'^G1.*\sZ([-+]?\d*\.?\d+)')
     g1_pattern = re.compile(r'^G1\s+(?:F[-+]?\d*\.?\d+\s+)'
                             r'?X([-+]?\d*\.?\d+)\s+Y([-+]?\d*\.?\d+)')
     arc_pattern = re.compile(r'(G[23])\s+X([-+]?\d*\.?\d+)\s+Y([-+]?\d*\.?\d+)'
@@ -286,36 +289,38 @@ def parse_gcode(gcode, arc_convert):
     for line in tqdm(gcode, desc='\033[97mParsing GCode'):
         z_match = re.search(z_pattern, line)
         if z_match:
+            old_z = z
             z = float(z_match.group(1))
-            continue
-        g1_match = re.search(g1_pattern, line)
-        if g1_match:
             if z not in coords:
                 coords[z] = []
+        g1_match = re.search(g1_pattern, line)
+        if g1_match:
             coords[z].append([float(g1_match.group(1)),
                               float(g1_match.group(2))])
             continue
         arc_match = re.search(arc_pattern, line)
         if arc_match:
             command = arc_match.group(1)
-            x, y = coords[z][-1]
+            try:
+                x, y = coords[z][-1]
+            except:
+                x, y = coords[old_z][-1]
             x1 = float(arc_match.group(2))
             y1 = float(arc_match.group(3))
             i = float(arc_match.group(4)) if arc_match.group(4) else 0.
             j = float(arc_match.group(5)) if arc_match.group(5) else 0.
             arcs.append([i, j])
             clockwise = command == 'G2'
-            arc_pos = arc_convert.G2(i=i, j=j, x=x1, y=y1, old_x=x, old_y=y, clockwise=clockwise)
+            arc_pos = ArcParser().G2(i=i, j=j, x=x1, y=y1, old_x=x, old_y=y, clockwise=clockwise)
             coords[z].extend(arc_pos[:-1])
     return coords, np.array(arcs)
 
-def main(path='C:/Users/nikit/Downloads/Telegram Desktop/SC_ArcLowres.gcode', max_velocity=500, max_accel=15000, mcr=0.5, scv=5.0):
+def main(path='', max_velocity=250, max_accel=15000, mcr=0, scv=5.0):
     global avgspeed
     if not path:
         path = input('Enter the path to the gcode file: ')
-    avgspeed = np.array([])
+    avgspeed = []
     toolhead = ToolHead(max_velocity, max_accel, mcr, scv)
-    arc = ArcParser()
     start_tm = time.perf_counter()
     # toolhead.set_position((15, 0))
     # for _, coord in enumerate(circle_coords):
@@ -324,25 +329,26 @@ def main(path='C:/Users/nikit/Downloads/Telegram Desktop/SC_ArcLowres.gcode', ma
     #         print(f"Progress: {_ / (polygons / 100)}%")
     with open(path, 'r') as file:
         lines = file.readlines()
-    moves, arcs = parse_gcode(lines, arc)
+    moves, arcs = parse_gcode(lines)
     # lenn = round(moves.shape[0] / 2.05)
     # moves = moves[lenn:-lenn]
+    print(f'GCode file: {path.rsplit("/", 1)[1]}')
     print(f'Total arcs: {arcs.shape[0]}')
     print(f'Total polygons: {len([pos for mas in moves.values() for pos in mas])}')
     flushed_moves = {}
-    for layer in moves:
-        toolhead.lookahead.output = []
-        toolhead.set_position(moves[layer][0])
-        for _, coord in enumerate(moves[layer]):
-            toolhead.move(coord, 500)
-            # if _ % 10000 == 1:
-            #     print(f"Progress: {_ / (polygons / 100):.2f}%")
-        toolhead.flush_lookahead()
-        # flushed_moves.append(toolhead.lookahead.output)
-        flushed_moves[layer] = toolhead.lookahead.output
-    # cruise_spd = (sum(avgspeed[len(avgspeed) // 5:-len(avgspeed) // 5])
-    #               / len(avgspeed[len(avgspeed) // 5:-len(avgspeed) // 5]))
-    avg_spd = avgspeed.mean()
+    # movess = moves.copy()
+    # moves.clear()
+    # moves[10.0] = movess[10.0]
+    # moves[1.0] = movess[1.0]
+    for layer in tqdm(moves, leave=False, desc=f'Processing movements'):
+        if moves[layer]:
+            toolhead.lookahead.output = []
+            toolhead.set_position(moves[layer][0])
+            for _, coord in enumerate(moves[layer]):
+                toolhead.move(coord, 500)
+            toolhead.flush_lookahead()
+            flushed_moves[layer] = toolhead.lookahead.output
+    avg_spd = np.array(avgspeed).mean()
     print(f"Total time: {time.perf_counter() - start_tm:.3f}")
     msg = (f'Max Speed: {max_velocity} mm/s\n'
            f'Acceleration: {max_accel} mm/s²\n'
@@ -350,10 +356,10 @@ def main(path='C:/Users/nikit/Downloads/Telegram Desktop/SC_ArcLowres.gcode', ma
            f'Square Corner Velocity: {scv} mm/s\n'
            f'Average Speed: {avg_spd:.2f} mm/s')
     print(msg + '\n')
-    # create = input('Create a plot? ').lower()
-    # if create in ['y', 'yes']:
-    # plot(flushed_moves, max_velocity, max_accel, mcr, scv, avg_spd)
-    plot_3d(flushed_moves, max_velocity, max_accel, mcr, scv, avg_spd)
+    moves_max_velocity = np.floor(
+        max(max(spd[1][0], spd[1][1]) for layer in flushed_moves.values() for spd in layer))
+    plot_data = prepare_plot_data(flushed_moves, moves_max_velocity)
+    plot_3d(plot_data, max_velocity, max_accel, mcr, scv, avg_spd, moves_max_velocity)
 
 def plot(flushed_moves, max_velocity, max_accel, min_cruise_ratio,
          square_corner_velocity, avg_spd):
@@ -397,18 +403,9 @@ def plot(flushed_moves, max_velocity, max_accel, min_cruise_ratio,
     plt.show()
     print('Plot was created')
 
-def plot_3d(flushed_moves, max_velocity, max_accel, min_cruise_ratio,
-         square_corner_velocity, avg_spd, max_points=2):
-    fig = plt.figure(figsize=(14, 14))
-    ax = fig.add_subplot(111, projection='3d')
-    ax.set_xlabel('X, mm', fontsize=14, labelpad=10, color='#333333')
-    ax.set_ylabel('Y, mm', fontsize=14, labelpad=10, color='#333333')
-    ax.set_zlabel('Z, mm', fontsize=14, labelpad=10, color='#333333')
-    moves_max_velocity = np.floor(
-        max(max(spd[1][0], spd[1][1]) for layer in flushed_moves.values() for spd in layer))
-    norm = Normalize(vmin=0, vmax=moves_max_velocity)
+def prepare_plot_data(flushed_moves, moves_max_velocity, max_points=2):
+    data = []
     cmap = plt.get_cmap('plasma')
-    print('Graph generation')
     for _, (z_value, moves) in enumerate(flushed_moves.items(), start=1):
         for move in tqdm(moves, leave=False, desc=f'Processing layer {_} of {len(flushed_moves)}'):
             color_start, color_end = move[1] / moves_max_velocity
@@ -417,9 +414,22 @@ def plot_3d(flushed_moves, max_velocity, max_accel, min_cruise_ratio,
             y = np.linspace(y1, y2, max_points)
             gradient_colors = np.linspace(color_start, color_end, max_points)
             colors = cmap(gradient_colors)[:, :3]
-            for i in range(len(x) - 1):
-                ax.plot([x[i], x[i + 1]], [y[i], y[i + 1]], [z_value, z_value], color=colors[i], lw=5)
-    print('Wait')
+            for i in range(max_points):
+                # data.append([x[i], y[i], z_value])
+                data.append([x[i], y[i], z_value, *colors[i]])
+    return np.array(data, dtype=object)
+
+def plot_3d(data, max_velocity, max_accel, min_cruise_ratio,
+         square_corner_velocity, avg_spd, moves_max_velocity):
+    fig = plt.figure(figsize=(14, 14))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.set_xlabel('X, mm', fontsize=14, labelpad=10, color='#333333')
+    ax.set_ylabel('Y, mm', fontsize=14, labelpad=10, color='#333333')
+    ax.set_zlabel('Z, mm', fontsize=14, labelpad=10, color='#333333')
+    norm = Normalize(vmin=0, vmax=moves_max_velocity)
+    cmap = plt.get_cmap('plasma')
+    print('Graph generation')
+    ax.scatter(data[:, 0], data[:, 1], data[:, 2], color=data[:, 3:6], lw=5)
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     cbar = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02, aspect=30, shrink=0.8)
     cbar.locator = ticker.MaxNLocator(nbins=10)
@@ -434,7 +444,7 @@ def plot_3d(flushed_moves, max_velocity, max_accel, min_cruise_ratio,
                 ha='center', fontsize=12,
                 bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 10}, color='#000000')
     ax.autoscale()
-    ax.set_zlim(0, max(flushed_moves.keys()) * 1)
+    # ax.set_zlim(0, max(flushed_moves.keys()) * 1)
     plt.tight_layout()
     plt.show()
     print('Plot was created')
