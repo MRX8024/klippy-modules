@@ -359,49 +359,8 @@ def main(path='', max_velocity=250, max_accel=15000, mcr=0, scv=5.0):
     moves_max_velocity = np.floor(
         max(max(spd[1][0], spd[1][1]) for layer in flushed_moves.values() for spd in layer))
     plot_data = prepare_plot_data(flushed_moves, moves_max_velocity)
+    # plot(plot_data, max_velocity, max_accel, mcr, scv, avg_spd, moves_max_velocity)
     plot_3d(plot_data, max_velocity, max_accel, mcr, scv, avg_spd, moves_max_velocity)
-
-def plot(flushed_moves, max_velocity, max_accel, min_cruise_ratio,
-         square_corner_velocity, avg_spd):
-    fig, ax = plt.subplots(figsize=(14, 14), facecolor='#f4f4f4')
-    ax.set_xlabel('X, mm', fontsize=14, labelpad=10, color='#333333')
-    ax.set_ylabel('Y, mm', fontsize=14, labelpad=10, color='#333333')
-    moves_max_velocity = np.floor(max(max(spd[1][0], spd[1][1]) for spd in flushed_moves))
-    sm = ScalarMappable(cmap='plasma', norm=Normalize(vmin=0, vmax=moves_max_velocity))
-    sm.set_array([])
-    print('Graph generation, wait')
-    max_points = 100
-    for move in flushed_moves:
-        color_start, color_end = move[1] / moves_max_velocity
-        # Plot_gradient_line
-        [x1, y1], [x2, y2] = move[0]
-        x = np.linspace(x1, x2, max_points)
-        y = np.linspace(y1, y2, max_points)
-        gradient_colors = np.linspace(color_start, color_end, max_points)
-        colormap = plt.get_cmap('plasma')
-        colors = colormap(gradient_colors)[:, :3]
-        points = np.array([x, y]).T.reshape(-1, 1, 2)
-        segments = np.concatenate([points[:-1], points[1:]], axis=1)
-        lc = LineCollection(segments, colors=colors, linewidth=5)
-        ax.add_collection(lc)
-    plt.figtext(0.5, 0.04,
-                f'Max Speed: {max_velocity} mm/s | '
-                f'Acceleration: {max_accel} mm/s² | '
-                f'Min Cruise Ratio: {min_cruise_ratio} | '
-                f'Square Corner Velocity: {square_corner_velocity} mm/s | '
-                f'Average Speed: {avg_spd:.2f} mm/s',
-                # f'Cruise Speed: {cruise_spd:.2f} mm/s',
-                ha='center', fontsize=12,
-                bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 10}, color='#000000')
-    cbar = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02, aspect=30, shrink=0.8)
-    cbar.locator = ticker.MaxNLocator(nbins=10)
-    cbar.set_label('Speed, mm/s', fontsize=12, color='#333333')
-    cbar.ax.yaxis.set_tick_params(color='#333333')
-    ax.autoscale()
-    ax.set_aspect('equal')
-    plt.tight_layout()
-    plt.show()
-    print('Plot was created')
 
 def prepare_plot_data(flushed_moves, moves_max_velocity, max_points=2):
     data = []
@@ -418,6 +377,35 @@ def prepare_plot_data(flushed_moves, moves_max_velocity, max_points=2):
                 # data.append([x[i], y[i], z_value])
                 data.append([x[i], y[i], z_value, *colors[i]])
     return np.array(data, dtype=object)
+
+def plot(data, max_velocity, max_accel, min_cruise_ratio,
+         square_corner_velocity, avg_spd, moves_max_velocity):
+    fig, ax = plt.subplots(figsize=(14, 14), facecolor='#f4f4f4')
+    ax.set_xlabel('X, mm', fontsize=14, labelpad=10, color='#333333')
+    ax.set_ylabel('Y, mm', fontsize=14, labelpad=10, color='#333333')
+    norm = Normalize(vmin=0, vmax=moves_max_velocity)
+    cmap = plt.get_cmap('plasma')
+    print('Graph generation')
+    ax.scatter(data[:, 0], data[:, 1], color=data[:, 3:6], lw=5)
+    sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
+    cbar = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02, aspect=30, shrink=0.8)
+    cbar.locator = ticker.MaxNLocator(nbins=10)
+    cbar.set_label('Speed, mm/s', fontsize=12, color='#333333')
+    cbar.ax.yaxis.set_tick_params(color='#333333')
+    plt.figtext(0.5, 0.04,
+                f'Max Speed: {max_velocity} mm/s | '
+                f'Acceleration: {max_accel} mm/s² | '
+                f'Min Cruise Ratio: {min_cruise_ratio} | '
+                f'Square Corner Velocity: {square_corner_velocity} mm/s | '
+                f'Average Speed: {avg_spd:.2f} mm/s',
+                # f'Cruise Speed: {cruise_spd:.2f} mm/s',
+                ha='center', fontsize=12,
+                bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 10}, color='#000000')
+    ax.autoscale()
+    ax.set_aspect('equal')
+    plt.tight_layout()
+    plt.show()
+    print('Plot2d was created')
 
 def plot_3d(data, max_velocity, max_accel, min_cruise_ratio,
          square_corner_velocity, avg_spd, moves_max_velocity):
@@ -447,7 +435,7 @@ def plot_3d(data, max_velocity, max_accel, min_cruise_ratio,
     # ax.set_zlim(0, max(flushed_moves.keys()) * 1)
     plt.tight_layout()
     plt.show()
-    print('Plot was created')
+    print('Plot3d was created')
 
 if __name__ == '__main__':
     main()
