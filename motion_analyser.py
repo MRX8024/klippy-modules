@@ -315,7 +315,7 @@ def parse_gcode(gcode):
             coords[z].extend(arc_pos[:-1])
     return coords, np.array(arcs)
 
-def main(path='', max_velocity=250, max_accel=15000, mcr=0, scv=5.0):
+def main(path='./', max_velocity=250, max_accel=15000, mcr=0, scv=5.0):
     global avgspeed
     if not path:
         path = input('Enter the path to the gcode file: ')
@@ -363,7 +363,7 @@ def main(path='', max_velocity=250, max_accel=15000, mcr=0, scv=5.0):
     plot_3d(plot_data, max_velocity, max_accel, mcr, scv, avg_spd, moves_max_velocity)
 
 def prepare_plot_data(flushed_moves, moves_max_velocity, max_points=2):
-    data = []
+    segments = []
     cmap = plt.get_cmap('plasma')
     for _, (z_value, moves) in enumerate(flushed_moves.items(), start=1):
         for move in tqdm(moves, leave=False, desc=f'Processing layer {_} of {len(flushed_moves)}'):
@@ -373,10 +373,9 @@ def prepare_plot_data(flushed_moves, moves_max_velocity, max_points=2):
             y = np.linspace(y1, y2, max_points)
             gradient_colors = np.linspace(color_start, color_end, max_points)
             colors = cmap(gradient_colors)[:, :3]
-            for i in range(max_points):
-                # data.append([x[i], y[i], z_value])
-                data.append([x[i], y[i], z_value, *colors[i]])
-    return np.array(data, dtype=object)
+            for i in range(max_points - 1):
+                segments.append([[x[i], x[i + 1]], [y[i], y[i + 1]], z_value, colors[i]])
+    return np.array(segments, dtype=object)
 
 def plot(data, max_velocity, max_accel, min_cruise_ratio,
          square_corner_velocity, avg_spd, moves_max_velocity):
@@ -386,7 +385,9 @@ def plot(data, max_velocity, max_accel, min_cruise_ratio,
     norm = Normalize(vmin=0, vmax=moves_max_velocity)
     cmap = plt.get_cmap('plasma')
     print('Graph generation')
-    ax.scatter(data[:, 0], data[:, 1], color=data[:, 3:6], lw=5)
+    # ax.scatter(data[:, 0], data[:, 1], color=data[:, 3], lw=5)
+    for moves in data:
+        ax.plot([moves[0][0], moves[0][1]], [moves[1][0], moves[1][1]], moves[2], color=moves[3], lw=5)
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     cbar = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02, aspect=30, shrink=0.8)
     cbar.locator = ticker.MaxNLocator(nbins=10)
@@ -401,7 +402,11 @@ def plot(data, max_velocity, max_accel, min_cruise_ratio,
                 # f'Cruise Speed: {cruise_spd:.2f} mm/s',
                 ha='center', fontsize=12,
                 bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 10}, color='#000000')
-    ax.autoscale()
+    # ax.autoscale()
+    xd, yd = np.array(list(zip(*[[a[0][0], a[1][0]] for a in data])))
+    ax.set_xlim(xd.min()-1, xd.max()+1)
+    ax.set_ylim(yd.min()-1, yd.max()+1)
+    # ax.set_zlim(data[:, 4].min(), data[:, 4].max())
     ax.set_aspect('equal')
     plt.tight_layout()
     plt.show()
@@ -417,7 +422,9 @@ def plot_3d(data, max_velocity, max_accel, min_cruise_ratio,
     norm = Normalize(vmin=0, vmax=moves_max_velocity)
     cmap = plt.get_cmap('plasma')
     print('Graph generation')
-    ax.scatter(data[:, 0], data[:, 1], data[:, 2], color=data[:, 3:6], lw=5)
+    # ax.scatter(data[:, 0], data[:, 1], data[:, 2], color=data[:, 3:6], lw=5)
+    for moves in data:
+        ax.plot([moves[0][0], moves[0][1]], [moves[1][0], moves[1][1]], moves[2], color=moves[3], lw=5)
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     cbar = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02, aspect=30, shrink=0.8)
     cbar.locator = ticker.MaxNLocator(nbins=10)
