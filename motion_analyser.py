@@ -130,7 +130,11 @@ class Move:
     def calc_junction(self, prev_move):
         axes_r, prev_axes_r = self.axes_r, prev_move.axes_r
         cos_theta = max(-(axes_r[0] * prev_axes_r[0] + axes_r[1] * prev_axes_r[1]), -0.999999)
-        sin_theta_d2 = min(max(math.sqrt(0.5 * (1.0 - round(cos_theta, 5))), 0.000001), 0.999999)
+        if math.acos(cos_theta) > math.radians(90):
+            sin_theta_d2 = min(max(math.sqrt(0.5 * (1. - round(
+                cos_theta * self.toolhead.scv_coeff, 5))), 0.000001), 0.999999)
+        else:
+            sin_theta_d2 = min(max(math.sqrt(0.5 * (1. - round(cos_theta, 5))), 0.000001), 0.999999)
         R_jd = sin_theta_d2 / (1. - sin_theta_d2)
         tan_theta_d2 = sin_theta_d2 / math.sqrt(0.5 * (1.0 + cos_theta))
         move_centripetal_v2 = .5 * self.move_d * tan_theta_d2 * self.accel
@@ -236,7 +240,7 @@ class LookAheadQueue:
 
 
 class ToolHead:
-    def __init__(self, max_velocity=500, max_accel=5000, mcr=0.5, scv=5.0):
+    def __init__(self, max_velocity=500, max_accel=5000, mcr=0.5, scv=5.0, scv_coeff=1.0):
         self.lookahead = LookAheadQueue(self)
         self.commanded_pos = [0.0, 0.0]
         self.max_velocity = max_velocity
@@ -245,6 +249,7 @@ class ToolHead:
         self.square_corner_velocity = scv
         self.junction_deviation = self.max_accel_to_decel = 0.0
         self._calc_junction_deviation()
+        self.scv_coeff = scv_coeff
 
     def flush_lookahead(self):
         self.lookahead.flush()
@@ -271,7 +276,7 @@ def circle(polygons=100, radius=15, x_center=0, y_center=0):
     y_coords = radius * np.sin(thetas) + y_center
     return np.column_stack((x_coords, y_coords))
 
-def parse_gcode(gcode):
+def parse_gcode(gcode, stop=0.):
     z = 0.
     old_z = 0.
     coords = {}
@@ -287,6 +292,8 @@ def parse_gcode(gcode):
         if z_match:
             old_z = z
             z = float(z_match.group(1))
+            if stop and z > stop:
+                break
             if z not in coords:
                 coords[z] = []
         g1_match = re.search(g1_pattern, line)
@@ -311,16 +318,16 @@ def parse_gcode(gcode):
             coords[z].extend(arc_pos[:-1])
     return coords, np.array(arcs)
 
-def main(path='./', max_velocity=250, max_accel=15000, mcr=0, scv=5.0):
+def main(path='./', max_velocity=250, max_accel=15000, mcr=0, scv=5., scv_coeff=1.):
     global avgspeed
     if not path:
         path = input('Enter the path to the gcode file: ')
     avgspeed = []
-    toolhead = ToolHead(max_velocity, max_accel, mcr, scv)
+    toolhead = ToolHead(max_velocity, max_accel, mcr, scv, scv_coeff)
     start_tm = time.perf_counter()
     with open(path, 'r') as file:
         lines = file.readlines()
-    moves, arcs = parse_gcode(lines)
+    moves, arcs = parse_gcode(lines, stop=0)
     print(f'GCode file: {path.rsplit("/", 1)[1]}')
     print(f'Total arcs: {arcs.shape[0]}')
     print(f'Total polygons: {len([pos for mas in moves.values() for pos in mas])}')
@@ -442,10 +449,11 @@ def plot_3d(data, max_velocity, max_accel, min_cruise_ratio,
 def scv_viewer(need_plot=False):
     global avgspeed
     avgspeed = []
-    max_velocity = 250
-    max_accel = 15000
-    mcr = 0
-    scv = 5.0
+    max_velocity = 100
+    max_accel = 10000
+    mcr = 0.
+    scv = 5.
+    scv_coeff = 1.
     start = (100, 0)
     radius = 100
     angles = range(0, 181)
@@ -455,7 +463,8 @@ def scv_viewer(need_plot=False):
         new_x = start[0] + radius * math.cos(angle)
         new_y = start[1] + radius * math.sin(angle)
         coords.append((new_x, new_y))
-    toolhead = ToolHead(max_velocity, max_accel, mcr, scv)
+    toolhead = ToolHead(max_velocity, max_accel, mcr, scv, scv_coeff)
+    real_scvs = []
     for angle, (x, y) in zip(angles, coords):
         toolhead.lookahead.output = []
         toolhead.set_position([0, 0])
@@ -464,6 +473,7 @@ def scv_viewer(need_plot=False):
         toolhead.flush_lookahead()
         flushed_moves = toolhead.lookahead.output[::-1]
         real_scv = flushed_moves[0][2][1][1]
+        real_scvs.append(real_scv)
         rad = math.radians(angle)
         x_сoeff = abs(math.cos(rad))
         y_сoeff = abs(math.sin(rad))
@@ -477,6 +487,44 @@ def scv_viewer(need_plot=False):
             plot(plot_data, max_velocity, max_accel, mcr, scv,
                  np.array(avgspeed).mean(), moves_max_velocity, False)
         avgspeed.clear()
+    angles_aprox = np.linspace(min(angles), max(angles), num=9999)
+    scv_aprox = np.interp(angles_aprox, angles, real_scvs)
+    points = np.array([angles_aprox, scv_aprox]).T.reshape(-1, 1, 2)
+    segments = np.concatenate([points[:-1], points[1:]], axis=1)
+    norm = Normalize(vmin=min(scv_aprox), vmax=max_velocity)
+    lc = LineCollection(segments, cmap=plt.get_cmap('plasma'), norm=norm)
+    lc.set_array(scv_aprox)
+    lc.set_linewidth(2)
+    fig, ax = plt.subplots(figsize=(10, 8))
+    ax.add_collection(lc)
+    ax.set_title('SCV speed on angle')
+    ax.set_xlabel('Angle')
+    ax.set_ylabel('Speed, mm/s')
+    ax.set_xlim(min(angles), max(angles))
+    ax.set_ylim(0, max_velocity)
+    ax.xaxis.set_major_locator(plt.MultipleLocator(10))
+    ax.xaxis.set_minor_locator(plt.MultipleLocator(5))
+    ax.yaxis.set_major_locator(plt.MultipleLocator(5))
+    ax.yaxis.set_minor_locator(plt.MultipleLocator(2.5))
+    ax.grid(which='major', color='gray', linestyle='-', linewidth=0.7)
+    ax.grid(which='minor', color='gray', linestyle=':', linewidth=0.5)
+    # fig.colorbar(lc, ax=ax, label="Speed, mm/s")
+    light_angles = [45, 90, 135]
+    light_scvs = np.interp(light_angles, angles_aprox, scv_aprox)
+    ax.plot(light_angles, light_scvs, 'o', color='red', markersize=5)
+    plt.figtext(
+        0.5, 0.025,
+        f'Max Speed: {max_velocity:.2f} mm/s | '
+        f'Acceleration: {max_accel} mm/s² | '
+        f'Min Cruise Ratio: {mcr} | '
+        f'Square Corner Velocity: {scv} mm/s | '
+        f'Average Speed: {np.mean(scv_aprox):.2f} mm/s',
+        ha='center', fontsize=9,
+        bbox={'facecolor': 'white', 'alpha': 0.8, 'pad': 10},
+        color='#000000')
+    plt.show()
 
 if __name__ == '__main__':
+    # scv_viewer()
+    # exit()
     main()
