@@ -130,7 +130,6 @@ class Move:
     def calc_junction(self, prev_move):
         axes_r, prev_axes_r = self.axes_r, prev_move.axes_r
         cos_theta = max(-(axes_r[0] * prev_axes_r[0] + axes_r[1] * prev_axes_r[1]), -0.999999)
-
         sin_theta_d2 = min(max(math.sqrt(0.5 * (1.0 - round(cos_theta, 5))), 0.000001), 0.999999)
         R_jd = sin_theta_d2 / (1. - sin_theta_d2)
         tan_theta_d2 = sin_theta_d2 / math.sqrt(0.5 * (1.0 + cos_theta))
@@ -180,9 +179,6 @@ class LookAheadQueue:
         self.queue = []
         self.output = []
 
-    def add_to_output(self, res):
-        self.output = res + self.output
-
     def flush(self, lazy=False):
         update_flush_count = lazy
         queue = self.queue
@@ -216,13 +212,13 @@ class LookAheadQueue:
                             for m, ms_v2, me_v2 in reversed(delayed):
                                 mc_v2 = min(mc_v2, ms_v2)
                                 res = m.set_junction(min(ms_v2, mc_v2), mc_v2, min(me_v2, mc_v2))
-                                self.add_to_output(res)
+                                self.output.append(res)
                         del delayed[:]
                 if not update_flush_count and i < flush_count:
                     cruise_v2 = min((start_v2 + reachable_start_v2) * .5
                                     , move.max_cruise_v2, peak_cruise_v2)
                     res = move.set_junction(min(start_v2, cruise_v2), cruise_v2, min(next_end_v2, cruise_v2))
-                    self.add_to_output(res)
+                    self.output.append(res)
             else:
                 # Delay calculating this move until peak_cruise_v2 is known
                 delayed.append((move, start_v2, next_end_v2))
@@ -322,24 +318,13 @@ def main(path='./', max_velocity=250, max_accel=15000, mcr=0, scv=5.0):
     avgspeed = []
     toolhead = ToolHead(max_velocity, max_accel, mcr, scv)
     start_tm = time.perf_counter()
-    # toolhead.set_position((15, 0))
-    # for _, coord in enumerate(circle_coords):
-    #     toolhead.move(coord, 500)
-    #     if _ % 100 == 1:
-    #         print(f"Progress: {_ / (polygons / 100)}%")
     with open(path, 'r') as file:
         lines = file.readlines()
     moves, arcs = parse_gcode(lines)
-    # lenn = round(moves.shape[0] / 2.05)
-    # moves = moves[lenn:-lenn]
     print(f'GCode file: {path.rsplit("/", 1)[1]}')
     print(f'Total arcs: {arcs.shape[0]}')
     print(f'Total polygons: {len([pos for mas in moves.values() for pos in mas])}')
     flushed_moves = {}
-    # movess = moves.copy()
-    # moves.clear()
-    # moves[10.0] = movess[10.0]
-    # moves[1.0] = movess[1.0]
     for layer in tqdm(moves, leave=False, desc=f'Processing movements'):
         if moves[layer]:
             toolhead.lookahead.output = []
@@ -347,7 +332,7 @@ def main(path='./', max_velocity=250, max_accel=15000, mcr=0, scv=5.0):
             for _, coord in enumerate(moves[layer]):
                 toolhead.move(coord, 500)
             toolhead.flush_lookahead()
-            flushed_moves[layer] = toolhead.lookahead.output
+            flushed_moves[layer] = toolhead.lookahead.output[::-1]
     avg_spd = np.array(avgspeed).mean()
     print(f"Total time: {time.perf_counter() - start_tm:.3f}")
     msg = (f'Max Speed: {max_velocity} mm/s\n'
@@ -357,37 +342,44 @@ def main(path='./', max_velocity=250, max_accel=15000, mcr=0, scv=5.0):
            f'Average Speed: {avg_spd:.2f} mm/s')
     print(msg + '\n')
     moves_max_velocity = np.floor(
-        max(max(spd[1][0], spd[1][1]) for layer in flushed_moves.values() for spd in layer))
+        max(spd[1][1][1] for layer in flushed_moves.values() for spd in layer))
     plot_data = prepare_plot_data(flushed_moves, moves_max_velocity)
     # plot(plot_data, max_velocity, max_accel, mcr, scv, avg_spd, moves_max_velocity)
     plot_3d(plot_data, max_velocity, max_accel, mcr, scv, avg_spd, moves_max_velocity)
 
-def prepare_plot_data(flushed_moves, moves_max_velocity, max_points=2):
+def prepare_plot_data(flushed_moves, moves_max_velocity, max_points=5):
     segments = []
     cmap = plt.get_cmap('plasma')
     for _, (z_value, moves) in enumerate(flushed_moves.items(), start=1):
         for move in tqdm(moves, leave=False, desc=f'Processing layer {_} of {len(flushed_moves)}'):
-            color_start, color_end = move[1] / moves_max_velocity
-            [x1, y1], [x2, y2] = move[0]
-            x = np.linspace(x1, x2, max_points)
-            y = np.linspace(y1, y2, max_points)
-            gradient_colors = np.linspace(color_start, color_end, max_points)
-            colors = cmap(gradient_colors)[:, :3]
-            for i in range(max_points - 1):
-                segments.append([[x[i], x[i + 1]], [y[i], y[i + 1]], z_value, colors[i]])
+            for part_move in move:
+                color_start, color_end = part_move[1] / moves_max_velocity
+                [x1, y1], [x2, y2] = part_move[0]
+                if color_start != color_end:
+                    x = np.linspace(x1, x2, max_points)
+                    y = np.linspace(y1, y2, max_points)
+                    gradient_colors = np.linspace(color_start, color_end, max_points)
+                    colors = cmap(gradient_colors)[:, :3]
+                    for i in range(max_points - 1):
+                        segments.append([[x[i], x[i+1]], [y[i], y[i+1]], z_value, colors[i]])
+                else:
+                    gradient_colors = np.linspace(color_start, color_end, 1)
+                    colors = cmap(gradient_colors)[:, :3]
+                    segments.append([[x1, x2], [y1, y2], z_value, colors])
     return np.array(segments, dtype=object)
 
 def plot(data, max_velocity, max_accel, min_cruise_ratio,
-         square_corner_velocity, avg_spd, moves_max_velocity):
+         square_corner_velocity, avg_spd, moves_max_velocity, feedback=True):
     fig, ax = plt.subplots(figsize=(14, 14), facecolor='#f4f4f4')
     ax.set_xlabel('X, mm', fontsize=14, labelpad=10, color='#333333')
     ax.set_ylabel('Y, mm', fontsize=14, labelpad=10, color='#333333')
     norm = Normalize(vmin=0, vmax=moves_max_velocity)
     cmap = plt.get_cmap('plasma')
-    print('Graph generation')
+    if feedback:
+        print('Graph generation')
     # ax.scatter(data[:, 0], data[:, 1], color=data[:, 3], lw=5)
     for moves in data:
-        ax.plot([moves[0][0], moves[0][1]], [moves[1][0], moves[1][1]], moves[2], color=moves[3], lw=5)
+        ax.plot([moves[0][0], moves[0][1]], [moves[1][0], moves[1][1]], 0, color=moves[3], lw=5)
     sm = plt.cm.ScalarMappable(norm=norm, cmap=cmap)
     cbar = plt.colorbar(sm, ax=ax, orientation='vertical', pad=0.02, aspect=30, shrink=0.8)
     cbar.locator = ticker.MaxNLocator(nbins=10)
@@ -410,10 +402,11 @@ def plot(data, max_velocity, max_accel, min_cruise_ratio,
     ax.set_aspect('equal')
     plt.tight_layout()
     plt.show()
-    print('Plot2d was created')
+    if feedback:
+        print('Plot2d was created')
 
 def plot_3d(data, max_velocity, max_accel, min_cruise_ratio,
-         square_corner_velocity, avg_spd, moves_max_velocity):
+         square_corner_velocity, avg_spd, moves_max_velocity, feedback=True):
     fig = plt.figure(figsize=(14, 14))
     ax = fig.add_subplot(111, projection='3d')
     ax.set_xlabel('X, mm', fontsize=14, labelpad=10, color='#333333')
@@ -421,7 +414,8 @@ def plot_3d(data, max_velocity, max_accel, min_cruise_ratio,
     ax.set_zlabel('Z, mm', fontsize=14, labelpad=10, color='#333333')
     norm = Normalize(vmin=0, vmax=moves_max_velocity)
     cmap = plt.get_cmap('plasma')
-    print('Graph generation')
+    if feedback:
+        print('Graph generation')
     # ax.scatter(data[:, 0], data[:, 1], data[:, 2], color=data[:, 3:6], lw=5)
     for moves in data:
         ax.plot([moves[0][0], moves[0][1]], [moves[1][0], moves[1][1]], moves[2], color=moves[3], lw=5)
@@ -442,7 +436,47 @@ def plot_3d(data, max_velocity, max_accel, min_cruise_ratio,
     # ax.set_zlim(0, max(flushed_moves.keys()) * 1)
     plt.tight_layout()
     plt.show()
-    print('Plot3d was created')
+    if feedback:
+        print('Plot3d was created')
+
+def scv_viewer(need_plot=False):
+    global avgspeed
+    avgspeed = []
+    max_velocity = 250
+    max_accel = 15000
+    mcr = 0
+    scv = 5.0
+    start = (100, 0)
+    radius = 100
+    angles = range(0, 181)
+    coords = []
+    for angle in angles:
+        angle = math.radians(angle)
+        new_x = start[0] + radius * math.cos(angle)
+        new_y = start[1] + radius * math.sin(angle)
+        coords.append((new_x, new_y))
+    toolhead = ToolHead(max_velocity, max_accel, mcr, scv)
+    for angle, (x, y) in zip(angles, coords):
+        toolhead.lookahead.output = []
+        toolhead.set_position([0, 0])
+        toolhead.move(start, 500)
+        toolhead.move([x, y], 500)
+        toolhead.flush_lookahead()
+        flushed_moves = toolhead.lookahead.output[::-1]
+        real_scv = flushed_moves[0][2][1][1]
+        rad = math.radians(angle)
+        x_сoeff = abs(math.cos(rad))
+        y_сoeff = abs(math.sin(rad))
+        print(f"Angle: {angle}°, coords: {start[:2]} --> ({x:.2f}, {y:.2f}),"
+              f" speed: {real_scv:.2f}, x_speed: {(x_сoeff * real_scv):.2f},"
+              f" y_speed: {(y_сoeff * real_scv):.2f} of 250 mm/s")
+        if need_plot:
+            moves_max_velocity = np.float64(flushed_moves[0][1][1][0])
+            plot_data = prepare_plot_data(
+                {'0': flushed_moves}, moves_max_velocity, max_points=15)
+            plot(plot_data, max_velocity, max_accel, mcr, scv,
+                 np.array(avgspeed).mean(), moves_max_velocity, False)
+        avgspeed.clear()
 
 if __name__ == '__main__':
     main()
