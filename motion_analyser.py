@@ -129,7 +129,7 @@ class Move:
 
     def calc_junction(self, prev_move):
         axes_r, prev_axes_r = self.axes_r, prev_move.axes_r
-        cos_theta = max(-(axes_r[0] * prev_axes_r[0] + axes_r[1] * prev_axes_r[1]), -0.999999)
+        cos_theta = min(max(-(axes_r[0] * prev_axes_r[0] + axes_r[1] * prev_axes_r[1]), -0.999999), 1.)
         if math.acos(cos_theta) > math.radians(90):
             sin_theta_d2 = min(max(math.sqrt(0.5 * (1. - round(
                 cos_theta * self.toolhead.scv_coeff, 5))), 0.000001), 0.999999)
@@ -318,17 +318,15 @@ def parse_gcode(gcode, stop=0.):
             coords[z].extend(arc_pos[:-1])
     return coords, np.array(arcs)
 
-def main(path='./', max_velocity=250, max_accel=15000, mcr=0, scv=5., scv_coeff=1.):
+def main(g_path='./', max_velocity=250, max_accel=15000, mcr=0, scv=5., scv_coeff=1.):
     global avgspeed
-    if not path:
-        path = input('Enter the path to the gcode file: ')
     avgspeed = []
     toolhead = ToolHead(max_velocity, max_accel, mcr, scv, scv_coeff)
     start_tm = time.perf_counter()
-    with open(path, 'r') as file:
+    with open(g_path, 'r') as file:
         lines = file.readlines()
     moves, arcs = parse_gcode(lines, stop=0)
-    print(f'GCode file: {path.rsplit("/", 1)[1]}')
+    print(f'GCode file: {g_path.rsplit("/", 1)[1]}')
     print(f'Total arcs: {arcs.shape[0]}')
     print(f'Total polygons: {len([pos for mas in moves.values() for pos in mas])}')
     flushed_moves = {}
