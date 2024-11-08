@@ -129,7 +129,10 @@ class Move:
 
     def calc_junction(self, prev_move):
         axes_r, prev_axes_r = self.axes_r, prev_move.axes_r
-        cos_theta = min(max(-(axes_r[0] * prev_axes_r[0] + axes_r[1] * prev_axes_r[1]), -0.999999), 1.)
+        cos_theta = -(axes_r[0] * prev_axes_r[0] + axes_r[1] * prev_axes_r[1])
+        if cos_theta > 0.999999:
+            return
+        cos_theta = max(cos_theta, -0.999999)
         if math.acos(cos_theta) > math.radians(90):
             sin_theta_d2 = min(max(math.sqrt(0.5 * (1. - round(
                 cos_theta * self.toolhead.scv_coeff, 5))), 0.000001), 0.999999)
