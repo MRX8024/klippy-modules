@@ -23,10 +23,8 @@ class ZProbe:
         self.config = config
         self.printer = config.get_printer()
         self.gcode = self.printer.lookup_object('gcode')
-
         self.query_endstops = self.printer.load_object(config, 'query_endstops')
-        # self._setup_pin()
-
+        self._setup_pin()
         self.probing_pos = config.getfloatlist('probing_position', count=3)
         self.probing_speed = config.getfloat('probing_speed', above=0.)
         self.samples = config.getint('samples', minval=1)
@@ -39,23 +37,30 @@ class ZProbe:
 
         self.printer.register_event_handler("klippy:connect",
                                             self._handle_connect)
-        self.gcode.register_command('Z_PROBE', self.CMD_z_probe,
-                                    desc=self.CMD_z_probe_help)
+        self.gcode.register_command('Z_PROBE', self.cmd_Z_PROBE,
+                                    desc=self.cmd_Z_PROBE_help)
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
         self.travel_speed = self.toolhead.max_velocity / 2
         self.travel_accel = min(self.toolhead.max_accel, 5000)
         self.kin = self.toolhead.get_kinematics()
-        self.z_endstop = self.printer.lookup_object('probe')
+        self.probe = self.printer.lookup_object('probe')
         # get endstop config
-        # for endstop, name in self.query_endstops.endstops:
-        #     if name == 'z':
-        #         self.z_endstop = EndstopWrapper(endstop)
+        ct = 0
+        for endstop, name in self.query_endstops.endstops:
+            if name == 'z_probe_endstop':
+                self.z_endstop = EndstopWrapper(endstop)
+                ct += 1
+            elif name == 'z':
+                self.z_endstop.mcu_endstop._dispatch = endstop.mcu_endstop._dispatch
+                ct += 1
+        if ct != 2:
+            raise self.config.error('Error in z_probe')
 
     def _setup_pin(self):
         ppins = self.printer.lookup_object('pins')
-        endstop_pin = self.config.get('probe_pin')
+        endstop_pin = self.config.get('pin')
         # pin_params = ppins.parse_pin(endstop_pin, True, True)
         # pin_name = "%s:%s" % (pin_params['chip_name'], pin_params['pin'])
         mcu_endstop = ppins.setup_pin('endstop', endstop_pin)
@@ -83,7 +88,7 @@ class ZProbe:
             self.gcode.respond_info(f"Probe at {curpos[2]:.6f}")
             return curpos
 
-    def _probe_run(self, gcmd, endstop, wiggle=False):
+    def _probe_run(self, gcmd, mcu_endstop, wiggle=False):
         pos = self.toolhead.get_position()
         if pos[2] < self.probing_pos[2] + 10:
             self._move([None, None, self.probing_pos[2] + 10], self.lift_speed)
@@ -92,14 +97,14 @@ class ZProbe:
 
         # check if switch is closed
         time = self.toolhead.get_last_move_time()
-        if self.z_endstop.mcu_probe.query_endstop(time):
-            raise self.gcode.error(f"Probe switch not closed!")
+        if self.z_endstop.query_endstop(time):
+            raise self.gcode.error(f"Z_probe switch not closed!")
 
         retries = 0
         poss = []
         while len(poss) < self.samples:
             # probe with second probing speed
-            curpos = self._probe(gcmd, endstop, self.probing_speed)
+            curpos = self._probe(gcmd, mcu_endstop, self.probing_speed)
             poss.append(curpos[:3])
             # check tolerance
             z_poss = [p[2] for p in poss]
@@ -114,15 +119,19 @@ class ZProbe:
 
         return np.mean(poss, axis=0)
 
-    CMD_z_probe_help = ''
-    def CMD_z_probe(self, gcmd):
+    cmd_Z_PROBE_help = ''
+    def cmd_Z_PROBE(self, gcmd):
         # self.gcode.respond_info(f'{self.z_endstop.mcu_endstop.steppers}')
+        # pst = self.probe.mcu_probe.get_steppers()
+        # self.gcode.respond_info(f'Probe steppers {len(pst)}')
+        # zst = self.z_endstop.get_steppers()
+        # self.gcode.respond_info(f'z_probe steppers {len(zst)}')
         # return
         now = self.printer.get_reactor().monotonic()
         if 'xyz' not in self.kin.get_status(now)['homed_axes']:
             raise gcmd.error(f"{gcmd.get_command()}: must home axes first")
 
-        xyz_pos = self._probe_run(gcmd, self.z_endstop.mcu_probe)
+        xyz_pos = self._probe_run(gcmd, self.z_endstop)
         self.gcode.respond_info(f'Z mean value: {xyz_pos[2]}')
 
 
