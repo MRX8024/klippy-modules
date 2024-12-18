@@ -1,3 +1,5 @@
+import numpy as np
+
 class AccelerometerHelper:
     def __init__(self, printer):
         self.printer = printer
@@ -26,18 +28,17 @@ class AccelerometerHelper:
         return self.samples
 
     def handle_batch(self, batch):
-        if self.is_finished:
-            return False
         samples = batch['data']
         ptime = self.toolhead.get_last_move_time()
+        now = self.reactor.monotonic()
+        pmtime = self.toolhead.mcu.estimated_print_time(now)
         last_mcu_time = samples[-1][0]
-        delta = ptime - last_mcu_time
-        # To avoid printing "garbage" callbacks
-        if delta > -1e5:
-            self.gcode.respond_info(
-                f"print_time: {ptime}, "
-                f"sample_mcu_time: {last_mcu_time}, "
-                f"delta: {delta}")
+        self.gcode.respond_info(
+            f"print_time: {ptime:.10f}, "
+            f"mcu_time: {pmtime:.10f} "
+            f"sample_mcu_time: {last_mcu_time:.10f}, ")
+        if self.is_finished:
+            return False
         self.samples.extend(samples)
         return True
 
@@ -81,6 +82,11 @@ class AccelTimingTest:
         for move in moves:
             aclient.request_start_time = self.toolhead.get_last_move_time()
             self.send(f'G0 X{move}')
+            # split_moves = np.arange(0, move, move / 5)
+            # for spl_move in split_moves:
+            #     self.send(f'G0 X{spl_move}')
+            #     now = self.reactor.monotonic()
+            #     self.reactor.pause(now + 0.050)
             aclient.request_end_time = self.toolhead.get_last_move_time()
             self.gcode.respond_info(f"measure_start_time: {aclient.request_start_time}")
             self.gcode.respond_info(f"measure_end_time: {aclient.request_end_time}")
@@ -98,9 +104,6 @@ class AccelTimingTest:
                 f"get_sample_delta: {ptime - aclient.request_end_time}")
             self.gcode.respond_info('')
         aclient.finish_measurements()
-        # Run moves
-        for move in moves:
-            self.send(f'G0 X{move}')
         self.send('G90')
 
 
