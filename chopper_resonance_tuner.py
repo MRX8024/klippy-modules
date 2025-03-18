@@ -514,9 +514,9 @@ class ChopperResonanceTuner:
         hstrt_max = gcmd.get_int('HSTRT_MAX', self.def_fields['hstrt'],
                                  minval=0, maxval=7)
         hend_min = gcmd.get_int('HEND_MIN', self.def_fields['hend'],
-                                minval=2, maxval=15)
+                                minval=0, maxval=15)
         hend_max = gcmd.get_int('HEND_MAX', self.def_fields['hend'],
-                                minval=2, maxval=15)
+                                minval=0, maxval=15)
         tpfd_min = gcmd.get_int('TPFD_MIN', self.def_fields['tpfd'],
                                 minval=0, maxval=15)
         tpfd_max = gcmd.get_int('TPFD_MAX', self.def_fields['tpfd'],
