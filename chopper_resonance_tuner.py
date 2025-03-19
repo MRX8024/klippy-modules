@@ -7,6 +7,7 @@ import os
 import logging
 import math
 import numpy as np
+import multiprocessing
 import plotly.graph_objects as go
 import json
 import time
@@ -15,10 +16,7 @@ from . import resonance_tester
 from . import shaper_calibrate
 
 RESULTS_FOLDER = os.path.expanduser('~/printer_data/config/adxl_results/chopper_resonance_tuner/')
-MEASURE_DELAY = 0.10        # Delay between damped oscillations and measurement
-MEASURE_SPEED = 200         # mm/s
-MEDIAN_FILTER_WINDOW = 3    # Number of window lines
-
+SAMPLES_FOLDER = RESULTS_FOLDER + 'tmp_samples/'
 TRINAMIC_DRIVERS = ["tmc2130", "tmc2208", "tmc2209", "tmc2240", "tmc2660",
     "tmc5160"]
 FCLK = 12 # MHz
@@ -27,8 +25,19 @@ def check_export_path(path):
     if not os.path.exists(path):
         try:
             os.makedirs(path)
-        except OSError as e:
+        except Exception as e:
             return f'Error generate path {path}: {e}'
+
+def remove_export_path(path):
+    if not os.path.exists(path):
+        return
+    try:
+        for filename in os.listdir(path):
+            filepath = os.path.join(path, filename)
+            os.remove(filepath)
+        os.rmdir(path)
+    except Exception as e:
+        return f'Error remove path {path}: {e}'
 
 
 class AccelHelper:
@@ -43,6 +52,7 @@ class AccelHelper:
         self.request_start_time = None
         self.request_timings = []
         self.max_freq = 0
+        self.samples_trim_size = 0
         self.static_noise = []
         self.gcode = self.printer.lookup_object('gcode')
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -51,6 +61,9 @@ class AccelHelper:
 
     def init_chip_config(self, chip_name):
         self.accel_config = self.printer.lookup_object(chip_name)
+
+    def set_samples_trim_size(self, s):
+        self.samples_trim_size = s
 
     def handle_batch(self, batch):
         if self.is_finished:
@@ -74,58 +87,47 @@ class AccelHelper:
         self.request_timings.append([self.request_start_time, end_time])
         self.request_start_time = None
 
-
     def _init_static(self):
         self.toolhead.dwell(1)
         self.static_noise = np.mean(self.samples, axis=0)
-
 
     def start_measurements(self):
         self.flush_data()
         self.accel_config.batch_bulk.add_client(self.handle_batch)
         self._init_static()
 
-
     def finish_measurements(self):
         self.toolhead.wait_moves()
         self.is_finished = True
 
     def _wait_samples(self):
-        lim = 5.
         while True:
+            last_mcu_time = self.samples[-1][0]
+            req_end_time = self.request_timings[0][1]
+            if last_mcu_time > req_end_time:
+                request_timings = self.request_timings[0][:]
+                del self.request_timings[0]
+                return request_timings
+            elif (last_mcu_time < req_end_time
+                  and len(self.request_timings) > 3):
+                raise self.gcode.error('chopper_resonance_tuner: '
+                                       'No data from accelerometer')
             now = self.reactor.monotonic()
-            self.reactor.pause(now + 0.5)
-            if self.request_timings:
-                last_mcu_time = self.samples[-1][0]
-                req_end_time = self.request_timings[0][1]
-                if last_mcu_time > req_end_time:
-                    request_timings = self.request_timings[0][:]
-                    del self.request_timings[0]
-                    return request_timings
-                elif (len(self.request_timings) > 3
-                      or last_mcu_time > req_end_time + lim):
-                    raise self.gcode.error('chopper_resonance_tuner: '
-                                           'No data from accelerometer')
+            self.reactor.pause(now + 0.1)
 
-    def _get_accel_samples(self):
-        start_t, stop_t = self._wait_samples()
+    def get_samples(self, start_t, stop_t):
         raw_data = np.array(self.samples)
         st_idx = np.searchsorted(raw_data[:, 0], start_t, side='left')
         end_idx = np.searchsorted(raw_data[:, 0], stop_t, side='right')
-        del self.samples[:end_idx]
         time_accels = raw_data[st_idx:end_idx]
-        return time_accels
-
-    def get_samples(self):
-        time_accels = self._get_accel_samples()
-        return np.array(time_accels[:, :])
+        return np.array(time_accels), end_idx
 
     def set_max_freq(self, max_freq):
         self.max_freq = max_freq
 
-    def samples_to_freq(self, data, cut=None):
-        if cut is not None:
-            trim = int(data.shape[0] // cut)
+    def samples_to_freq(self, data):
+        if self.samples_trim_size:
+            trim = int(data.shape[0] // self.samples_trim_size)
             data = data[trim:-trim]
         cal_data = self.sh_helper.process_accelerometer_data(data)
         cal_data.normalize_to_frequencies()
@@ -140,9 +142,9 @@ class AccelHelper:
         max_power = psd[max_power_index]
         return max_power, freqs, psd, px, py, pz
 
-    def samples_to_vects(self, data, cut=None):
-        if cut is not None:
-            trim = int(data.shape[0] // cut)
+    def samples_to_vects(self, data):
+        if self.samples_trim_size:
+            trim = int(data.shape[0] // self.samples_trim_size)
             data = data[trim:-trim]
         data = data - self.static_noise
         times = data[:, 0]
@@ -153,62 +155,99 @@ class AccelHelper:
 
 
 class SamplesCollector:
-    def __init__(self, printer, tuner, chip_helper, plt_helpers):
+    def __init__(self, printer, chip_helper):
         self.printer = printer
-        self.gcode = self.printer.lookup_object('gcode')
-        self.reactor = printer.get_reactor()
-        self.tuner = tuner
         self.chip_helper = chip_helper
-        self.plt_helpers = plt_helpers
-        self.error = None
+        self.gcode = printer.lookup_object('gcode')
+        self.reactor = printer.get_reactor()
         self.collector_timer = None
+        self.names = []
+        self.procs = []
+        self.error = None
+
+    def set_names(self, names):
+        self.names = names
 
     def check_error(self):
         return self.error
 
+    def _check_procs(self):
+        while self.procs:
+            proc, p_conn = self.procs.pop()
+            if proc.is_alive():
+                return
+            err, res = p_conn.recv()
+            if err:
+                self.error = res
+                return
+            del self.chip_helper.samples[:res]
+
     def _collect_sample(self, eventtime):
-        def _collect():
-            try:
-                data = self.chip_helper.get_samples()
-                cdata = self.chip_helper.samples_to_freq(
-                    data[:], 5)
-                # cvdata = self.chip_helper.samples_to_vects(
-                #   data[:], 5)
-                self.plt_helpers[0].add_bar(*cdata)
-                # self.plt_helpers[1].add_bar(name, *cvdata)
-            except Exception as e:
-                self.error = e
-                self.stop_collector()
-        _collect()
-        now = self.reactor.monotonic()
+        self._check_procs()
         delay = 1.0
+        if not self.chip_helper.request_timings:
+            return eventtime + delay
+        try:
+            t_range = self.chip_helper._wait_samples()
+        except Exception as e:
+            self.error = e
+            return self.reactor.NEVER
+        def save_sample():
+            try:
+                samples, end_idx = \
+                    self.chip_helper.get_samples(*t_range)
+                mp, fq, psd, px, py, pz = \
+                    self.chip_helper.samples_to_freq(samples)
+                filepath = os.path.join(SAMPLES_FOLDER, filename)
+                np.savez_compressed(filepath, mp=mp, fq=fq,
+                                    psd=psd, px=px, py=py, pz=pz)
+                c_conn.send((False, end_idx))
+                c_conn.close()
+            except Exception as e:
+                c_conn.send((True, e))
+                c_conn.close()
+        filename = self.names.pop(0)
+        p_conn, c_conn = multiprocessing.Pipe()
+        proc = multiprocessing.Process(target=save_sample)
+        proc.daemon = True
+        proc.start()
+        self.procs.append((proc, p_conn))
         if len(self.chip_helper.request_timings) > 1:
-            delay = 0.05
+            delay = 0.1
+        now = self.reactor.monotonic()
         return now + delay
 
     def start_collector(self):
         if self.collector_timer is None:
+            self.error = None
+            if err := check_export_path(SAMPLES_FOLDER):
+                self.gcode.error(str(err))
+            self.chip_helper.start_measurements()
             now = self.reactor.monotonic()
             self.collector_timer = self.reactor.register_timer(
                 self._collect_sample, now + 1.0)
 
     def stop_collector(self):
         if self.collector_timer is not None:
-            while self.chip_helper.request_timings:
+            while (self.chip_helper.request_timings
+                   and not self.error):
                 now = self.reactor.monotonic()
-                self.reactor.pause(now + 0.01)
+                self.reactor.pause(now + 0.1)
+            self.chip_helper.finish_measurements()
             self.reactor.unregister_timer(self.collector_timer)
             self.collector_timer = None
-            self.error = None
+            self.names.clear()
+            self.procs.clear()
 
 
 class LinearTest:
-    def __init__(self, printer, *args):
-        self.printer = printer
-        self.reactor = printer.get_reactor()
-        self.toolhead = printer.lookup_object('toolhead')
-        self.travel_speed = self.toolhead.max_velocity / 2
+    def __init__(self, tuner, *args):
+        self.printer = tuner.printer
         self.min_speed, self.max_speed = args
+        tuner.chip_helper.set_samples_trim_size(5)
+        self.reactor = self.printer.get_reactor()
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.travel_speed = self.toolhead.max_velocity / 2
         self.travel_distance = self.max_speed * 2.0
 
     def run_movement(self, speed):
@@ -216,18 +255,19 @@ class LinearTest:
         travel_distance = (self.travel_distance / self.max_speed) * speed
         position = travel_distance + x
         self.toolhead.manual_move([position], speed)
-        self.reactor.pause(self.reactor.monotonic() + 0.01)
+        # self.reactor.pause(self.reactor.monotonic() + 0.01)
         self.toolhead.manual_move([x], self.travel_speed)
 
 
 class ResonanceTest:
-    def __init__(self, printer, *args):
-        self.printer = printer
-        self.reactor = printer.get_reactor()
-        self.gcode = self.printer.lookup_object('gcode')
-        self.toolhead = printer.lookup_object('toolhead')
-        self.travel_speed = self.toolhead.max_velocity / 2
+    def __init__(self, tuner, *args):
+        self.printer = tuner.printer
         gn, self.axis = args
+        tuner.chip_helper.set_samples_trim_size(0)
+        self.reactor = self.printer.get_reactor()
+        self.gcode = self.printer.lookup_object('gcode')
+        self.toolhead = self.printer.lookup_object('toolhead')
+        self.travel_speed = self.toolhead.max_velocity / 2
         self.test_seq = gn.gen_test()
 
     def run_movement(self, speed):
@@ -296,7 +336,7 @@ class ChopperResonanceTuner:
         self.stepper_en = self.printer.lookup_object(config, 'stepper_enable')
         self.input_shaper = self.printer.load_object(config, 'input_shaper')
         self.res_tester = self.printer.load_object(config, 'resonance_tester')
-        self.plt_helpers = (PlotterHelper(),)*1
+        self.plt_helper = PlotterHelper(self.printer)
         self.printer.register_event_handler("klippy:connect", self._handle_connect)
         self._init_axes()
         # Read config
@@ -307,6 +347,7 @@ class ChopperResonanceTuner:
                                     self.cmd_RUN_TUNER,
                                     desc=self.cmd_RUN_TUNER_help)
         # Variables
+        self.ask_user = False
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
@@ -315,8 +356,7 @@ class ChopperResonanceTuner:
         self.kin = self.toolhead.get_kinematics()
         self._init_steppers()
         self.chip_helper = AccelHelper(self.printer, self.accel_chip)
-        self.collector = SamplesCollector(
-            self.printer, self, self.chip_helper, self.plt_helpers)
+        self.collector = SamplesCollector(self.printer, self.chip_helper)
 
     def lookup_config(self, section, entry, default=None):
         section = self.config.getsection(section)
@@ -407,11 +447,19 @@ class ChopperResonanceTuner:
         self.force_move.manual_move(mcu_stepper,
             dist, self.travel_speed, self.travel_accel)
 
-    def generate_plot(self, axis_name):
-        for plt in self.plt_helpers:
-            plot = plt.generate_html()
-            path = plt.save_plot(plot, axis_name, self.chip_helper.chip_name)
-            self.gcode.respond_info(f'Access to interactive plot at: {path}')
+    def check_recovery(self, gcmd):
+        recovery = gcmd.get('RECOVERY', None)
+        if os.path.exists(SAMPLES_FOLDER):
+            if self.ask_user and recovery is None:
+                self.ask_user = False
+                return None
+            if recovery is not None:
+                return True
+            gcmd.respond_info(
+                'Uncompleted test was found, to continue it '
+                'enter: CHOPPER_RESONANCE_TUNER RECOVERY=1')
+            self.ask_user = True
+            return False
 
     def prestart(self):
         # Going to initial position
@@ -421,6 +469,17 @@ class ChopperResonanceTuner:
             raise self.gcode.error("Must home axes first")
         # self.toolhead.manual_move(self.initial_pos, speed=self.travel_speed)
         self.toolhead.wait_moves()
+
+    def generate_plot(self, axis_name):
+        def run():
+            plot = self.plt_helper.generate_html()
+            if plot is None:
+                return
+            path = self.plt_helper.save_plot(
+                plot, axis_name, self.chip_helper.chip_name)
+            self.gcode.respond_info(f'Access to interactive '
+                                    f'plot at: {path}')
+        run()
 
     def enable_extra_steppers(self, mode):
         ptime = self.toolhead.get_last_move_time()
@@ -433,8 +492,6 @@ class ChopperResonanceTuner:
     def finish_test(self, axis, last_fields, toolhead_info):
         self.gsend('M84')
         self.enable_extra_steppers(1)
-        self.collector.stop_collector()
-        self.chip_helper.finish_measurements()
         # Restore the original fields
         ptime = self.toolhead.get_last_move_time()
         for field, val in self.def_fields.items():
@@ -457,10 +514,16 @@ class ChopperResonanceTuner:
             f'SET_VELOCITY_LIMIT ACCEL={old_ma} '
             f'MINIMUM_CRUISE_RATIO={old_mcr}')
         self.input_shaper.enable_shaping()
+        self.collector.stop_collector()
         self.generate_plot(axis)
+        remove_export_path(SAMPLES_FOLDER)
 
     cmd_RUN_TUNER_help = 'Start chopper resonance analyzing'
     def cmd_RUN_TUNER(self, gcmd):
+        # status = self.check_recovery(gcmd)
+        # if status is False:
+        #     return
+        # elif status is None
         # Live variables
         axis_name = 'x'
         # axis_name = gcmd.get('AXIS', self.axes[0]).lower()
@@ -526,13 +589,13 @@ class ChopperResonanceTuner:
         speed_change_step = gcmd.get_int('SPEED_CHANGE_STEP',
                                          1, minval=0, maxval=100)
         # iterations = gcmd.get_int('ITERATIONS', 1, minval=0, maxval=100)
-        methods = {'linear': LinearTest(self.printer, min_speed, max_speed),
-                   'resonance': ResonanceTest(self.printer, gn, axis)}
+        methods = {'linear': LinearTest(self, min_speed, max_speed),
+                   'resonance': ResonanceTest(self, gn, axis)}
         method_str = gcmd.get('METHOD', 'linear').lower()
         method = methods.get(method_str, None)
         if method is None:
             raise self.gcode.error(f'Invalid method: {method_str}')
-        # Restore variables
+        # For future restore
         now = self.reactor.monotonic()
         toolhead_info = self.toolhead.get_status(now)
         # Variables
@@ -564,8 +627,7 @@ class ChopperResonanceTuner:
                     },
                 })
         last_fields = self.def_fields.copy()
-        self.plt_helpers[0].set_names([s['params']['name']
-                                       for s in test_seq])
+        self.collector.set_names([s['params']['name'] for s in test_seq])
         # Run
         # self.prestart()
         self.toolhead.set_position([50,50,0,0],homing_axes='xyz')
@@ -573,11 +635,13 @@ class ChopperResonanceTuner:
         self.enable_extra_steppers(0)
         self.input_shaper.disable_shaping()
         self.chip_helper.set_max_freq(freq_end)
-        self.chip_helper.start_measurements()
-        self.toolhead.dwell(0.2)
         self.collector.start_collector()
+        self.toolhead.wait_moves()
 
         for seq in test_seq:
+            # now = self.reactor.monotonic()
+            # ptime = max(self.toolhead.get_last_move_time() - 0.3,
+            #             self.toolhead.mcu.estimated_print_time(now))
             ptime = self.toolhead.get_last_move_time()
             for field, val in seq['fields'].items():
                 if last_fields[field] != val:
@@ -594,22 +658,18 @@ class ChopperResonanceTuner:
                         self.set_reg(st['tmc'], field, val, ptime)
             speed = seq['params']['speed']
             name = seq['params']['name']
-            # Wait
-            while len(self.chip_helper.request_timings) > 2:
-                now = self.reactor.monotonic()
-                self.reactor.pause(now + 0.5)
             # Run
             self.gcode.respond_info(f'Testing: {name}')
-            self.chip_helper.update_start_time()
             try:
-                method.run_movement(speed)
                 err = self.collector.check_error()
                 if err is not None:
                     raise self.gcode.error(err)
+                self.chip_helper.update_start_time()
+                method.run_movement(speed)
+                self.chip_helper.update_end_time()
             except self.gcode.error as e:
                 self.finish_test(axis_name, last_fields, toolhead_info)
                 raise self.gcode.error(str(e))
-            self.chip_helper.update_end_time()
         self.finish_test(axis_name, last_fields, toolhead_info)
 
 
@@ -617,16 +677,11 @@ class PlotterHelper:
     colors = ['', '#2F4F4F', '#12B57F', '#9DB512', '#DF8816',
               '#1297B5', '#5912B5', '#B51284', '#127D0C']
 
-    def __init__(self):
-        self.graph_data = []
-        self.names = []
+    def __init__(self, printer):
+        if err := check_export_path(RESULTS_FOLDER):
+            printer.error(str(err))
 
-    def set_names(self, names):
-        self.names = names
-
-    def add_bar(self, max_power, freqs, psd, px, py, pz, name=None):
-        if name is None:
-            name = self.names.pop(0)
+    def add_bar(self, name, max_power, freqs, psd, px, py, pz):
         dx = freqs.tolist()
         fig = go.Figure()
         fig.add_trace(go.Scatter(
@@ -647,12 +702,25 @@ class PlotterHelper:
             yaxis_title='Power spectral density',
             yaxis_tickformat=".2e", autosize=True,
             hovermode='x unified', margin=dict(l=40, r=40, t=80, b=40))
-        self.graph_data.append([[name, max_power], fig.to_dict()])
+        return [[name, float(max_power)], fig.to_dict()]
+
+    def generate_bars(self):
+        subplots = []
+        for filename in os.listdir(SAMPLES_FOLDER):
+            if not filename.endswith('.npz'):
+                continue
+            filepath = os.path.join(SAMPLES_FOLDER, filename)
+            data = [np.load(filepath)[key] for key in
+                    ['mp', 'fq', 'psd', 'px', 'py', 'pz']]
+            subplots.append(self.add_bar(filename, *data))
+        return subplots
 
     def generate_html(self):
+        subplots = self.generate_bars()
+        if not subplots:
+            return
         fig = go.Figure()
-        # main_x, main_y = zip(*[e[0] for e in self.graph_data])
-        for p, _ in self.graph_data:
+        for p, _ in subplots:
             toff = int(p[0].split('_')[2].split('=')[1])
             color = self.colors[toff if toff <= 8 else toff - 8]
             fig.add_trace(go.Bar(x=[p[1]], y=[p[0]], orientation='h',
@@ -663,7 +731,7 @@ class PlotterHelper:
             autosize=True, margin=dict(l=40, r=40, t=80, b=40))
 
         main_graph = fig.to_dict()
-        sec_graphs = {e[0][1]: e[1] for e in self.graph_data}
+        sec_graphs = {e[0][1]: e[1] for e in subplots}
 
         html_template = f"""
         <!DOCTYPE html>
@@ -733,13 +801,12 @@ class PlotterHelper:
         </body>
         </html>
         """
-        self.graph_data.clear()
         return html_template
 
     def save_plot(self, template, axis, chip_name):
         now = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = os.path.join(RESULTS_FOLDER, f'resonances_{axis}_{now}_{chip_name}.html')
-        check_export_path(RESULTS_FOLDER)
+        filename = os.path.join(RESULTS_FOLDER,
+            f'resonances_{axis}_{now}_{chip_name}.html')
         with open(filename, "w", encoding="utf-8") as f:
             f.write(template)
         return filename
