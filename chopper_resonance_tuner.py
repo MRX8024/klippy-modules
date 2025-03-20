@@ -173,7 +173,7 @@ class SamplesCollector:
 
     def _check_procs(self):
         while self.procs:
-            proc, p_conn = self.procs.pop()
+            proc, p_conn = self.procs[0]
             if proc.is_alive():
                 return
             err, res = p_conn.recv()
@@ -181,6 +181,7 @@ class SamplesCollector:
                 self.error = res
                 return
             del self.chip_helper.samples[:res]
+            del self.procs[0]
 
     def _collect_sample(self, eventtime):
         self._check_procs()
@@ -229,8 +230,9 @@ class SamplesCollector:
 
     def stop_collector(self):
         if self.collector_timer is not None:
-            while (self.chip_helper.request_timings
+            while ((self.chip_helper.request_timings or self.procs)
                    and not self.error):
+                self._check_procs()
                 now = self.reactor.monotonic()
                 self.reactor.pause(now + 0.1)
             self.chip_helper.finish_measurements()
@@ -706,7 +708,9 @@ class PlotterHelper:
 
     def generate_bars(self):
         subplots = []
-        for filename in os.listdir(SAMPLES_FOLDER):
+        data_folder = sorted(os.listdir(SAMPLES_FOLDER), key=lambda x:
+            os.path.getmtime(os.path.join(SAMPLES_FOLDER, x)))
+        for filename in data_folder:
             if not filename.endswith('.npz'):
                 continue
             filepath = os.path.join(SAMPLES_FOLDER, filename)
