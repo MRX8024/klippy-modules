@@ -120,7 +120,7 @@ class AccelHelper:
         st_idx = np.searchsorted(raw_data[:, 0], start_t, side='left')
         end_idx = np.searchsorted(raw_data[:, 0], stop_t, side='right')
         time_accels = raw_data[st_idx:end_idx]
-        return np.array(time_accels), end_idx
+        return np.array(time_accels), end_idx - st_idx
 
     def set_max_freq(self, max_freq):
         self.max_freq = max_freq
@@ -195,14 +195,14 @@ class SamplesCollector:
             return self.reactor.NEVER
         def save_sample():
             try:
-                samples, end_idx = \
+                samples, samples_ct = \
                     self.chip_helper.get_samples(*t_range)
                 mp, fq, psd, px, py, pz = \
                     self.chip_helper.samples_to_freq(samples)
                 filepath = os.path.join(SAMPLES_FOLDER, filename)
                 np.savez_compressed(filepath, mp=mp, fq=fq,
                                     psd=psd, px=px, py=py, pz=pz)
-                c_conn.send((False, end_idx))
+                c_conn.send((False, samples_ct))
                 c_conn.close()
             except Exception as e:
                 c_conn.send((True, e))
