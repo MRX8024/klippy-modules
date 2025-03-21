@@ -75,6 +75,7 @@ class AccelHelper:
     def flush_data(self):
         self.is_finished = False
         self.samples.clear()
+        self.request_start_time = None
         self.request_timings.clear()
 
     def update_start_time(self):
@@ -89,7 +90,9 @@ class AccelHelper:
 
     def _init_static(self):
         self.toolhead.dwell(1)
-        self.static_noise = np.mean(self.samples, axis=0)
+        self.toolhead.wait_moves()
+        raw_data = np.array(self.samples)
+        self.static_noise = np.median(raw_data[:, 1:], axis=0)
 
     def start_measurements(self):
         self.flush_data()
@@ -146,9 +149,8 @@ class AccelHelper:
         if self.samples_trim_size:
             trim = int(data.shape[0] // self.samples_trim_size)
             data = data[trim:-trim]
-        data = data - self.static_noise
         times = data[:, 0]
-        data = np.array(data[:, 1:])
+        data = np.array(data[:, 1:]) - self.static_noise
         vects = np.linalg.norm(data, axis=1)
         md_magnitude = np.median(vects)
         return md_magnitude, times, vects
@@ -253,12 +255,14 @@ class LinearTest:
         self.travel_distance = self.max_speed * 2.0
 
     def run_movement(self, speed):
-        x, *args = self.toolhead.get_position()
+        self.init_x, *args = self.toolhead.get_position()
         travel_distance = (self.travel_distance / self.max_speed) * speed
-        position = travel_distance + x
+        position = travel_distance + self.init_x
         self.toolhead.manual_move([position], speed)
         # self.reactor.pause(self.reactor.monotonic() + 0.01)
-        self.toolhead.manual_move([x], self.travel_speed)
+
+    def run_to_init_position(self):
+        self.toolhead.manual_move([self.init_x], self.travel_speed)
 
 
 class ResonanceTest:
@@ -273,7 +277,7 @@ class ResonanceTest:
         self.test_seq = gn.gen_test()
 
     def run_movement(self, speed):
-        X, Y, Z, E = old_pos = self.toolhead.get_position()
+        X, Y, Z, E = self.old_pos = self.toolhead.get_position()
         # Override maximum acceleration and acceleration to
         # deceleration based on the maximum test frequency
         systime = self.reactor.monotonic()
@@ -324,7 +328,9 @@ class ResonanceTest:
             self.toolhead.move([X + decel_X, Y + decel_Y, Z, E], abs(last_v))
             self.toolhead.cmd_M204(self.gcode.create_gcode_command(
                 "M204", "M204", {"S": old_max_accel}))
-        self.toolhead.move(old_pos, speed=self.travel_speed)
+
+    def run_to_init_position(self):
+        self.toolhead.move(self.old_pos, speed=self.travel_speed)
 
 
 class ChopperResonanceTuner:
@@ -333,13 +339,13 @@ class ChopperResonanceTuner:
         self.printer = config.get_printer()
         self.reactor = self.printer.get_reactor()
         self.gcode = self.printer.lookup_object('gcode')
-        self.gcode_move = self.printer.lookup_object(config, 'gcode_move')
         self.force_move = self.printer.lookup_object(config, 'force_move')
         self.stepper_en = self.printer.lookup_object(config, 'stepper_enable')
         self.input_shaper = self.printer.load_object(config, 'input_shaper')
         self.res_tester = self.printer.load_object(config, 'resonance_tester')
         self.plt_helper = PlotterHelper(self.printer)
-        self.printer.register_event_handler("klippy:connect", self._handle_connect)
+        self.printer.register_event_handler("klippy:connect",
+                                            self._handle_connect)
         self._init_axes()
         # Read config
         self.accel_chip = self.config.get('accel_chip')
@@ -391,33 +397,39 @@ class ChopperResonanceTuner:
                 f"chopper_resonance_tuner: unable to find "
                 f"TMC driver for '{stepper_name}' stepper")
 
-    def get_reg(self, tmc, field):
-        if tmc.fields.lookup_register(field, None) is None:
-            raise self.gcode.error(f'Unknown field: {field}')
-        reg = tmc.fields.lookup_register(field)
-        val = tmc.mcu_tmc.get_register(reg)
-        val = tmc.fields.get_field(field, val)
-        return val
-
-    def set_reg(self, tmc, field, val, ptime):
-        bit = tmc.fields.set_field(field, val)
-        reg_name = tmc.fields.lookup_register(field)
-        if self.debug: self.gcode.respond_info(
-                f'Setting field: {field.upper()}={val}')
-        tmc.mcu_tmc.set_register(reg_name, bit, ptime)
-
     def _init_def_registers(self):
-        tmc_name = list(self.kin_steppers.values())[0]['tmc_name']
+        stepper = list(self.kin_steppers.values())[0]
+        tmc_name = stepper['tmc_name']
+        tmc = stepper['tmc']
         configfile = self.printer.lookup_object('configfile')
         sconfig = configfile.get_status(None)['settings']
         tcf = sconfig.get(tmc_name)
         self.def_fields = {
             'current': int(tcf['run_current'] * 1000),
-            'tbl': tcf['driver_tbl'],
-            'toff': tcf['driver_toff'],
-            'hstrt': tcf['driver_hstrt'],
-            'hend': tcf['driver_hend'],
-            'tpfd': tcf['driver_tpfd'],
+            'tbl': tcf.get('driver_tbl',
+                self.get_field(tmc, 'tbl')),
+            'toff': tcf.get('driver_toff',
+                self.get_field(tmc, 'toff')),
+            'hstrt': tcf.get('driver_hstrt',
+                self.get_field(tmc, 'hstrt')),
+            'hend': tcf.get('driver_hend',
+                self.get_field(tmc, 'hend')),
+            'tpfd': tcf.get('driver_tpfd',
+                self.get_field(tmc, 'tpfd')),
+            'pwm_autoscale': tcf.get('driver_pwm_autoscale',
+                self.get_field(tmc, 'pwm_autoscale')),
+            'pwm_autograd': tcf.get('driver_pwm_autograd',
+                self.get_field(tmc, 'pwm_autograd')),
+            'pwm_freq': tcf.get('driver_pwm_freq',
+                self.get_field(tmc, 'pwm_freq')),
+            'pwm_grad': tcf.get('driver_pwm_grad',
+                self.get_field(tmc, 'pwm_grad')),
+            'pwm_ofs': tcf.get('driver_pwm_ofs',
+                self.get_field(tmc, 'pwm_ofs')),
+            'pwm_reg': tcf.get('driver_pwm_reg',
+                self.get_field(tmc, 'pwm_reg')),
+            'pwm_lim': tcf.get('driver_pwm_lim',
+                self.get_field(tmc, 'pwm_lim')),
         }
 
     def _init_steppers(self):
@@ -449,6 +461,32 @@ class ChopperResonanceTuner:
         self.force_move.manual_move(mcu_stepper,
             dist, self.travel_speed, self.travel_accel)
 
+    def get_field(self, tmc, field):
+        if tmc.fields.lookup_register(field, None) is None:
+            raise self.gcode.error(f'Unknown field: {field}')
+        reg_name = tmc.fields.lookup_register(field)
+        reg = tmc.mcu_tmc.get_register(reg_name)
+        val = tmc.fields.get_field(field, reg)
+        return val
+
+    def set_reg(self, tmc, field, val, ptime):
+        reg_name = tmc.fields.lookup_register(field)
+        bit = tmc.fields.set_field(field, val, reg_name=reg_name)
+        if self.debug: self.gcode.respond_info(
+                f'Setting field: {field.upper()}={val}')
+        tmc.mcu_tmc.set_register(reg_name, bit, ptime)
+
+    def set_field(self, stepper, field, val, ptime):
+        if field == 'current':
+            current = val / 1000
+            st_name = stepper['stepper'].get_name()
+            self.gsend(f"SET_TMC_CURRENT "
+                       f"STEPPER={st_name} "
+                       f"CURRENT={current} "
+                       f"HOLDCURRENT={current}")
+            return
+        self.set_reg(stepper['tmc'], field, val, ptime)
+
     def check_recovery(self, gcmd):
         recovery = gcmd.get('RECOVERY', None)
         if os.path.exists(SAMPLES_FOLDER):
@@ -474,14 +512,34 @@ class ChopperResonanceTuner:
 
     def generate_plot(self, axis_name):
         def run():
-            plot = self.plt_helper.generate_html()
-            if plot is None:
-                return
-            path = self.plt_helper.save_plot(
-                plot, axis_name, self.chip_helper.chip_name)
-            self.gcode.respond_info(f'Access to interactive '
-                                    f'plot at: {path}')
-        run()
+            try:
+                plot = self.plt_helper.generate_html()
+                if plot is None:
+                    return
+                path = self.plt_helper.save_plot(
+                    plot, axis_name, self.chip_helper.chip_name)
+                msg = f'Access to interactive plot at: {path}'
+                c_conn.send((False, msg))
+                c_conn.close()
+            except Exception as e:
+                c_conn.send((True, e))
+                c_conn.close()
+        p_conn, c_conn = multiprocessing.Pipe()
+        proc = multiprocessing.Process(target=run)
+        proc.daemon = True
+        proc.start()
+        now = last_report_time = self.reactor.monotonic()
+        while proc.is_alive():
+            if now > last_report_time + 5.:
+                last_report_time = now
+                self.gcode.respond_info('Plot generation...')
+            now = self.reactor.pause(now + .1)
+        err, res = p_conn.recv()
+        if err:
+            self.gcode.error(f'Plot generation finished '
+                             f'with error: {err}')
+        p_conn.close()
+        self.gcode.respond_info(res)
 
     def enable_extra_steppers(self, mode):
         ptime = self.toolhead.get_last_move_time()
@@ -500,15 +558,7 @@ class ChopperResonanceTuner:
             if last_fields[field] == val:
                 continue
             for st in self.kin_steppers.values():
-                if field == 'current':
-                    current = val / 1000
-                    st_name = st['stepper'].get_name()
-                    self.gsend(f"SET_TMC_CURRENT "
-                               f"STEPPER={st_name} "
-                               f"CURRENT={current} "
-                               f"HOLDCURRENT={current}")
-                    continue
-                self.set_reg(st['tmc'], field, val, ptime)
+                self.set_field(st, field, val, ptime)
         # Restore the original acceleration values
         old_ma = toolhead_info['max_accel']
         old_mcr = toolhead_info['minimum_cruise_ratio']
@@ -559,44 +609,77 @@ class ChopperResonanceTuner:
         gn.test_sweeping_period = test_sweeping_period
         # Fields
         curr_min_ma = gcmd.get_int('CURRENT_MIN_MA',
-                                   self.def_fields['current'])
+            self.def_fields['current'], minval=100)
         curr_max_ma = gcmd.get_int('CURRENT_MAX_MA',
-                                   self.def_fields['current'])
+            self.def_fields['current'], minval=curr_min_ma)
         curr_change_step = gcmd.get_int('CURRENT_CHANGE_STEP',
-                                        100, minval=10, maxval=1000)
-        tbl_min = gcmd.get_int('TBL_MIN', self.def_fields['tbl'],
-                               minval=0, maxval=3)
-        tbl_max = gcmd.get_int('TBL_MAX', self.def_fields['tbl'],
-                               minval=0, maxval=3)
-        toff_min = gcmd.get_int('TOFF_MIN', self.def_fields['toff'],
-                                minval=1, maxval=15)
-        toff_max = gcmd.get_int('TOFF_MAX', self.def_fields['toff'],
-                                minval=1, maxval=15)
+            100, minval=10, maxval=1000)
+        tbl_min = gcmd.get_int('TBL_MIN',
+            self.def_fields['tbl'], minval=0, maxval=3)
+        tbl_max = gcmd.get_int('TBL_MAX',
+            self.def_fields['tbl'], minval=tbl_min, maxval=3)
+        toff_min = gcmd.get_int('TOFF_MIN',
+            self.def_fields['toff'], minval=1, maxval=15)
+        toff_max = gcmd.get_int('TOFF_MAX',
+            self.def_fields['toff'], minval=toff_min, maxval=15)
         hstrt_hend_max = gcmd.get_int('HSTRT_HEND_MAX',
-                                      15, minval=1, maxval=15)
-        hstrt_min = gcmd.get_int('HSTRT_MIN', self.def_fields['hstrt'],
-                                 minval=0, maxval=7)
-        hstrt_max = gcmd.get_int('HSTRT_MAX', self.def_fields['hstrt'],
-                                 minval=0, maxval=7)
-        hend_min = gcmd.get_int('HEND_MIN', self.def_fields['hend'],
-                                minval=0, maxval=15)
-        hend_max = gcmd.get_int('HEND_MAX', self.def_fields['hend'],
-                                minval=0, maxval=15)
-        tpfd_min = gcmd.get_int('TPFD_MIN', self.def_fields['tpfd'],
-                                minval=0, maxval=15)
-        tpfd_max = gcmd.get_int('TPFD_MAX', self.def_fields['tpfd'],
-                                minval=0, maxval=15)
-        min_speed = gcmd.get_int('MIN_SPEED', 1, minval=0, maxval=250)
-        max_speed = gcmd.get_int('MAX_SPEED', 1, minval=0, maxval=250)
+            15, minval=1, maxval=15)
+        hstrt_min = gcmd.get_int('HSTRT_MIN',
+            self.def_fields['hstrt'], minval=0, maxval=7)
+        hstrt_max = gcmd.get_int('HSTRT_MAX',
+            self.def_fields['hstrt'], minval=hstrt_min, maxval=7)
+        hend_min = gcmd.get_int('HEND_MIN',
+            self.def_fields['hend'], minval=0, maxval=15)
+        hend_max = gcmd.get_int('HEND_MAX',
+            self.def_fields['hend'], minval=hend_min, maxval=15)
+        tpfd_min = gcmd.get_int('TPFD_MIN',
+            self.def_fields['tpfd'], minval=0, maxval=15)
+        tpfd_max = gcmd.get_int('TPFD_MAX',
+            self.def_fields['tpfd'], minval=tpfd_min, maxval=15)
+        pwm_autoscale_min = gcmd.get_int('PWM_AUTOSCALE_MIN',
+            self.def_fields['pwm_autoscale'], minval=0, maxval=1)
+        pwm_autoscale_max = gcmd.get_int('PWM_AUTOSCALE_MAX',
+            self.def_fields['pwm_autoscale'],
+                minval=pwm_autoscale_min, maxval=1)
+        pwm_autograd_min = gcmd.get_int('PWM_AUTOGRAD_MIN',
+            self.def_fields['pwm_autograd'], minval=0, maxval=1)
+        pwm_autograd_max = gcmd.get_int('PWM_AUTOGRAD_MAX',
+            self.def_fields['pwm_autograd'],
+                minval=pwm_autograd_min, maxval=1)
+        pwm_freq_min = gcmd.get_int('PWM_FREQ_MIN',
+            self.def_fields['pwm_freq'], minval=0, maxval=3)
+        pwm_freq_max = gcmd.get_int('PWM_FREQ_MAX',
+            self.def_fields['pwm_freq'], minval=pwm_freq_min, maxval=3)
+        pwm_grad_min = gcmd.get_int('PWM_GRAD_MIN',
+            self.def_fields['pwm_grad'], minval=0, maxval=255)
+        pwm_grad_max = gcmd.get_int('PWM_GRAD_MAX',
+            self.def_fields['pwm_grad'], minval=pwm_grad_min, maxval=255)
+        pwm_ofs_min = gcmd.get_int('PWM_OFS_MIN',
+            self.def_fields['pwm_ofs'], minval=0, maxval=255)
+        pwm_ofs_max = gcmd.get_int('PWM_OFS_MAX',
+            self.def_fields['pwm_ofs'], minval=pwm_ofs_min, maxval=255)
+        pwm_reg_min = gcmd.get_int('PWM_REG_MIN',
+            self.def_fields['pwm_reg'], minval=0, maxval=15)
+        pwm_reg_max = gcmd.get_int('PWM_REG_MAX',
+            self.def_fields['pwm_reg'], minval=pwm_reg_min, maxval=15)
+        pwm_lim_min = gcmd.get_int('PWM_LIM_MIN',
+            self.def_fields['pwm_lim'], minval=0, maxval=15)
+        pwm_lim_max = gcmd.get_int('PWM_LIM_MAX',
+            self.def_fields['pwm_lim'], minval=pwm_lim_min, maxval=15)
+        min_speed = gcmd.get_int('MIN_SPEED',
+            1, minval=1, maxval=self.travel_speed)
+        max_speed = gcmd.get_int('MAX_SPEED',
+            1, minval=1, maxval=self.travel_speed)
         speed_change_step = gcmd.get_int('SPEED_CHANGE_STEP',
-                                         1, minval=0, maxval=100)
+            1, minval=1, maxval=100)
         # iterations = gcmd.get_int('ITERATIONS', 1, minval=0, maxval=100)
-        methods = {'linear': LinearTest(self, min_speed, max_speed),
-                   'resonance': ResonanceTest(self, gn, axis)}
+        methods = {'linear': lambda: LinearTest(self, min_speed, max_speed),
+                   'resonance': lambda: ResonanceTest(self, gn, axis)}
         method_str = gcmd.get('METHOD', 'linear').lower()
         method = methods.get(method_str, None)
         if method is None:
             raise self.gcode.error(f'Invalid method: {method_str}')
+        method = method()
         # For future restore
         now = self.reactor.monotonic()
         toolhead_info = self.toolhead.get_status(now)
@@ -609,25 +692,46 @@ class ChopperResonanceTuner:
             for hend in range(hend_min, hend_max + 1):
              if hstrt + hend <= hstrt_hend_max:
               for tpfd in range(tpfd_min, tpfd_max + 1):
-               for speed in range(min_speed, max_speed + 1, speed_change_step):
-                freq = float(round(1/(2*(12+32*toff)*1/(1000000*FCLK)+2*1/(
-                             1000000*FCLK)*16*(1.5**tbl))/1000, 1))
-                n = (f'current={current}_tbl={tbl}_toff={toff}_hstrt={hstrt}'
-                     f'_hend={hend}_tpfd={tpfd}_speed={speed}_freq={freq}kHz')
-                test_seq.append({
-                    'fields': {
-                        'current': current,
-                        'tbl': tbl,
-                        'toff': toff,
-                        'hstrt': hstrt,
-                        'hend': hend,
-                        'tpfd': tpfd,
-                    },
-                    'params': {
-                        'speed': speed,
-                        'name': n,
-                    },
-                })
+               for pwm_autoscale in range(pwm_autoscale_min, pwm_autoscale_max + 1):
+                for pwm_autograd in range(pwm_autograd_min, pwm_autograd_max + 1):
+                 for pwm_freq in range(pwm_freq_min, pwm_freq_max + 1):
+                  for pwm_grad in range(pwm_grad_min, pwm_grad_max + 1):
+                   for pwm_ofs in range(pwm_ofs_min, pwm_ofs_max + 1):
+                    for pwm_reg in range(pwm_reg_min, pwm_reg_max + 1):
+                     for pwm_lim in range(pwm_lim_min, pwm_lim_max + 1):
+                      for speed in range(min_speed, max_speed + 1, speed_change_step):
+                       freq = float(round(1/(2*(12+32*toff)*1/(1000000*FCLK)+2*1/(
+                                    1000000*FCLK)*16*(1.5**tbl))/1000, 1))
+                       n = (f'current={current}_tbl={tbl}_toff={toff}_hstrt={hstrt}'
+                            f'_hend={hend}_tpfd={tpfd}_pwm_autoscale={pwm_autoscale}'
+                            f'_pwm_autograd={pwm_autograd}_pwm_freq={pwm_freq}'
+                            f'_pwm_grad={pwm_grad}_pwm_ofs={pwm_ofs}_pwm_reg={pwm_reg}'
+                            f'_pwm_lim={pwm_lim}_speed={speed}_freq={freq}kHz')
+                       test_seq.append({
+                           'fields': {
+                               'current': current,
+                               'tbl': tbl,
+                               'toff': toff,
+                               'hstrt': hstrt,
+                               'hend': hend,
+                               'tpfd': tpfd,
+                               'pwm_autoscale': pwm_autoscale,
+                               'pwm_autograd': pwm_autograd,
+                               'pwm_freq': pwm_freq,
+                               'pwm_grad': pwm_grad,
+                               'pwm_ofs': pwm_ofs,
+                               'pwm_reg': pwm_reg,
+                               'pwm_lim': pwm_lim,
+                           },
+                           'params': {
+                               'speed': speed,
+                               'name': n,
+                           },
+                       })
+        ptime = self.toolhead.get_last_move_time()
+        for field, val in self.def_fields.items():
+            for st in self.steppers.values():
+                self.set_field(st, field, val, ptime)
         last_fields = self.def_fields.copy()
         self.collector.set_names([s['params']['name'] for s in test_seq])
         # Run
@@ -649,15 +753,7 @@ class ChopperResonanceTuner:
                 if last_fields[field] != val:
                     last_fields[field] = val
                     for st in self.steppers.values():
-                        if field == 'current':
-                            current = val / 1000
-                            st_name = st['stepper'].get_name()
-                            self.gsend(f"SET_TMC_CURRENT "
-                                       f"STEPPER={st_name} "
-                                       f"CURRENT={current} "
-                                       f"HOLDCURRENT={current}")
-                            continue
-                        self.set_reg(st['tmc'], field, val, ptime)
+                        self.set_field(st, field, val, ptime)
             speed = seq['params']['speed']
             name = seq['params']['name']
             # Run
@@ -669,6 +765,7 @@ class ChopperResonanceTuner:
                 self.chip_helper.update_start_time()
                 method.run_movement(speed)
                 self.chip_helper.update_end_time()
+                method.run_to_init_position()
             except self.gcode.error as e:
                 self.finish_test(axis_name, last_fields, toolhead_info)
                 raise self.gcode.error(str(e))
