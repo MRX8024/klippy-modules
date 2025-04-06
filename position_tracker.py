@@ -22,7 +22,7 @@ class PositionTracker:
                                        self._handle_home_rails_end)
         # Read config
         self.sensor_name = config.get('sensor')
-        self.tolerance = config.getfloat('tolerance', 1.0)
+        self.max_difference = config.getfloat('max_difference', 1.0)
         self.runout_gcode = config.get('runout_gcode', None)
         if self.runout_gcode is not None:
             gm = printer.load_object(config, 'gcode_macro')
@@ -50,15 +50,15 @@ class PositionTracker:
                 f'Option stepper in section '
                 f'{self.sensor_name} must be specified')
         self.kin = self.toolhead.get_kinematics()
-        self.stepper = [s for s in self.kin.get_steppers()
+        self.mcu_stepper = [s for s in self.kin.get_steppers()
                         if stepper_name == s.get_name()][0]
         for i, rail in enumerate(self.kin.rails):
-            if self.stepper in rail.get_steppers():
+            if self.mcu_stepper in rail.get_steppers():
                 self.axis = 'xyz'[i]
                 break
 
     def normalize_encoder_pos(self, pos, offset):
-        rd = self.stepper.get_rotation_distance()[0]
+        rd = self.mcu_stepper.get_rotation_distance()[0]
         return rd / ((1 << 16) / pos) + offset
 
     def _batch_handle(self, samples):
@@ -69,8 +69,8 @@ class PositionTracker:
         enc_ptime, enc_raw_pos = samples['data'][-1]
         enc_pos = self.normalize_encoder_pos(
             enc_raw_pos, samples['position_offset'])
-        mcu_pos = self.stepper.get_past_mcu_position(enc_ptime)
-        req_pos = self.stepper.mcu_to_commanded_position(mcu_pos)
+        mcu_pos = self.mcu_stepper.get_past_mcu_position(enc_ptime)
+        req_pos = self.mcu_stepper.mcu_to_commanded_position(mcu_pos)
         self.resp_clock += 1
         if self.resp_clock == 200:
             self.resp_clock = 0
@@ -80,7 +80,8 @@ class PositionTracker:
                 f"req_pos: {req_pos:.3f}, "
                 f"enc_pos: {enc_pos:.3f}, "
                 f"enc_t: {enc_ptime:.3f}")
-        if req_pos - 1 < enc_pos < req_pos + 1:
+        if (req_pos-self.max_difference
+                < enc_pos < req_pos+self.max_difference):
             return True
         reactor = self.printer.get_reactor()
         now = reactor.monotonic()
@@ -91,6 +92,7 @@ class PositionTracker:
         if self.runout_gcode:
             self.gcode.respond_info(msg)
             self.gcode.run_script(self.runout_gcode.render() + "\nM400")
+            return True
         else:
             self.printer.invoke_shutdown(msg)
 
@@ -136,6 +138,11 @@ class PositionTracker:
 
     cmd_POSITION_TRACKER_help = 'Position tracker'
     def cmd_POSITION_TRACKER(self, gcmd):
+        enable = gcmd.get_int('ENABLE', -1)
+        if enable == 0:
+            self.pause_tracker()
+        elif enable == 1:
+            self.resume_tracker()
         self.gcode.respond_info(f"Position tracker {self.sensor_name}: "
                                 f"{self.get_status(None)['status']}")
 
