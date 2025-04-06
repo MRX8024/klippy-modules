@@ -1,93 +1,147 @@
 # Script for tracking stepper position with encoder
 #
-# Copyright (C) 2024  Maksim Bolgov <maksim8024@gmail.com>
+# Copyright (C) 2025 Maksim Bolgov <maksim8024@gmail.com>
 #
 # This file may be distributed under the terms of the GNU GPLv3 license.
 import logging
-import numpy as np
 
-class AngleTracker:
+class PositionTracker:
     def __init__(self, config):
-        self.config = config
         self.printer = printer = config.get_printer()
-        self.reactor = printer.get_reactor()
-        self.gcode = printer.lookup_object('gcode')
-        self.motion_report = printer.load_object(config, 'motion_report')
-        printer.register_event_handler("klippy:connect", self._handle_connect)
-        self.gcode.register_command('ANGLE_RUN', self.cmd_ANGLE_RUN,
-                                    desc=self.cmd_ANGLE_RUN_help)
-        self.time_pos = []
+        self.gcode = gcode = printer.lookup_object('gcode')
+        # Register event handlers
+        printer.register_event_handler("klippy:connect",
+                                       self._handle_connect)
+        self.printer.register_event_handler("klippy:shutdown",
+                                            self._handle_shutdown)
+        printer.register_event_handler("stepper_enable:motor_off",
+                                       self._motor_off)
+        printer.register_event_handler("homing:home_rails_begin",
+                                       self._handle_home_rails_begin)
+        printer.register_event_handler("homing:home_rails_end",
+                                       self._handle_home_rails_end)
+        # Read config
+        self.sensor_name = config.get('sensor')
+        self.tolerance = config.getfloat('tolerance', 1.0)
+        self.runout_gcode = config.get('runout_gcode', None)
+        if self.runout_gcode is not None:
+            gm = printer.load_object(config, 'gcode_macro')
+            self.runout_gcode = gm.load_template(config, 'runout_gcode')
+        # Register commands
+        gcode.register_mux_command("POSITION_TRACKER", "CHIP",
+                                   self.sensor_name,
+                                   self.cmd_POSITION_TRACKER,
+                                   desc=self.cmd_POSITION_TRACKER_help)
+        # Variables
+        self.toolhead = None
+        self.sensor = None
+        self.stepper = None
+        self.axis = None
+        self.is_running = False
+        self.is_paused = False
+        self.resp_clock = 0
 
     def _handle_connect(self):
         self.toolhead = self.printer.lookup_object('toolhead')
-        kin = self.toolhead.get_kinematics()
-        self.steppers = [s for s in kin.get_steppers() for ax in 'xy'
-                         if 'stepper_' + ax in s.get_name()]
-
-    def _dump_stepper_handle(self, msg):
-        start_position = msg['start_position']
-        first_step_time = msg['first_step_time']
-        self.time_pos.append((first_step_time, start_position))
-        return True
-
-    def _find_closest(self, samples, t_thresh=0.001):
-        arr = np.array(samples['data'])
-        times = arr[:, 0]
-        for i, time_pos in enumerate(reversed(self.time_pos)):
-            diffs = times - time_pos[0]
-            positive_diffs = diffs[diffs >= 0]
-            if len(positive_diffs) > 0:
-                min_diff_idx = np.argmin(positive_diffs)
-                min_diff = positive_diffs[min_diff_idx]
-                if min_diff <= t_thresh:
-                    ind = diffs.tolist().index(min_diff)
-                    del self.time_pos[:-i+1]
-                    return *time_pos, *arr[ind]
-        return None, None, None, None
+        self.sensor = self.printer.lookup_object(self.sensor_name)
+        stepper_name = self.sensor.calibration.stepper_name
+        if stepper_name is None:
+            raise self.printer.config_error(
+                f'Option stepper in section '
+                f'{self.sensor_name} must be specified')
+        self.kin = self.toolhead.get_kinematics()
+        self.stepper = [s for s in self.kin.get_steppers()
+                        if stepper_name == s.get_name()][0]
+        for i, rail in enumerate(self.kin.rails):
+            if self.stepper in rail.get_steppers():
+                self.axis = 'xyz'[i]
+                break
 
     def normalize_encoder_pos(self, pos, offset):
-        pos = 40 / ((1 << 16) / pos)
-        return pos + offset
+        rd = self.stepper.get_rotation_distance()[0]
+        return rd / ((1 << 16) / pos) + offset
 
-    def _angle_handle(self, samples):
-        if not self.time_pos:
+    def _batch_handle(self, samples):
+        if not self.is_running:
+            return False
+        if self.is_paused:
             return True
-        timing, pred_pos, enc_timing, enc_raw_pos = self._find_closest(samples)
-        if timing is None:
+        enc_ptime, enc_raw_pos = samples['data'][-1]
+        enc_pos = self.normalize_encoder_pos(
+            enc_raw_pos, samples['position_offset'])
+        mcu_pos = self.stepper.get_past_mcu_position(enc_ptime)
+        req_pos = self.stepper.mcu_to_commanded_position(mcu_pos)
+        self.resp_clock += 1
+        if self.resp_clock == 200:
+            self.resp_clock = 0
+            self.gcode.respond_info(
+                f"{self.sensor_name}: "
+                f"delta_p: {req_pos-enc_pos:.3f}, "
+                f"req_pos: {req_pos:.3f}, "
+                f"enc_pos: {enc_pos:.3f}, "
+                f"enc_t: {enc_ptime:.3f}")
+        if req_pos - 1 < enc_pos < req_pos + 1:
             return True
-        offset = samples['position_offset']
-        enc_pos = self.normalize_encoder_pos(enc_raw_pos, offset)
-        self.gcode.respond_info(
-            f"delta_p: {pred_pos-enc_pos:.3f}, delta_t: {timing-enc_timing:.3f} "
-            f"pred_pos: {pred_pos:.3f}, enc_pos: {enc_pos:.3f}, "
-            f"pred_t: {timing:.3f}, enc_t: {enc_timing:.3f}")
-        if not (pred_pos -1 < enc_pos < pred_pos + 1):
-            self.gcode.respond_info(f'skipped steps detected!')
-            # self.printer.invoke_shutdown(f'Skipped steps detected!')
-        return True
+        reactor = self.printer.get_reactor()
+        now = reactor.monotonic()
+        est_print_time = self.toolhead.mcu.estimated_print_time(now)
+        msg = (f'Skipped steps detected on {self.sensor_name}: '
+               f'required_pos={req_pos:.3f} sensor_pos={enc_pos:.3f} '
+               f'ptime={est_print_time:.3f} sensor_time={enc_ptime:.3f}')
+        if self.runout_gcode:
+            self.gcode.respond_info(msg)
+            self.gcode.run_script(self.runout_gcode.render() + "\nM400")
+        else:
+            self.printer.invoke_shutdown(msg)
 
-    cmd_ANGLE_RUN_help = 'cmd_ANGLE_RUN_help'
-    def cmd_ANGLE_RUN(self, gcmd):
-        # st = self.steppers[0]
-        # st_mcu = st.get_mcu()
-        # now = self.reactor.monotonic()
-        # est_ptime = self.toolhead.mcu.estimated_print_time(now)
-        # est_clock = st_mcu.seconds_to_clock(est_ptime)
-        # clock_100ms = st_mcu.seconds_to_clock(0.100)
-        # start_clock = max(0, est_clock - clock_100ms)
-        # end_clock = est_clock + clock_100ms
-        # steps = st.dump_steps(128, start_clock, end_clock)
-        # self.gcode.respond_info(str(steps))
-        st = self.steppers[0]
-        mot_st = self.motion_report.steppers.get(st.get_name(), None)
-        if mot_st is None:
-            self.gcode.error("Unknown stepper '%s'" % st.get_name())
-        mot_st.batch_bulk.add_client(self._dump_stepper_handle)
-        mot_st.batch_bulk.batch_interval = 0.1
-        chip_name = 'angle ' + st.get_name()
-        angle_cfg = self.printer.lookup_object(chip_name)
-        angle_cfg.add_client(self._angle_handle)
+    def start_tracker(self):
+        self.is_running = True
+        self.is_paused = False
+        self.sensor.batch_bulk.batch_interval = 0.005
+        self.sensor.add_client(self._batch_handle)
+
+    def stop_tracker(self):
+        self.is_running = False
+        self.is_paused = False
+
+    def pause_tracker(self):
+        self.is_paused = True
+
+    def resume_tracker(self):
+        self.is_paused = False
+        homed = self.axis in self.kin.get_status(None)['homed_axes']
+        if not self.is_running and homed:
+            self.start_tracker()
+
+    def _handle_shutdown(self):
+        self.stop_tracker()
+
+    def _motor_off(self, ptime):
+        self.stop_tracker()
+
+    def _handle_home_rails_begin(self, homing, rails):
+        self.pause_tracker()
+
+    def _handle_home_rails_end(self, homing, rails):
+        self.resume_tracker()
+
+    def get_status(self, ptime):
+        if not self.is_running:
+            msg = 'disabled'
+        elif self.is_paused:
+            msg = 'paused'
+        else:
+            msg = 'running'
+        return {'status': msg}
+
+    cmd_POSITION_TRACKER_help = 'Position tracker'
+    def cmd_POSITION_TRACKER(self, gcmd):
+        self.gcode.respond_info(f"Position tracker {self.sensor_name}: "
+                                f"{self.get_status(None)['status']}")
 
 
 def load_config(config):
-    return AngleTracker(config)
+    return PositionTracker(config)
+
+def load_config_prefix(config):
+    return PositionTracker(config)
