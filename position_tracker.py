@@ -500,7 +500,7 @@ class PositionTracker:
         self.stop_client()
         # self.reactor.unregister_timer(self.timer)
 
-    def _motor_off(self, ptime):
+    def _motor_off(self, ptime=None):
         self.stop_client()
 
     def _handle_home_rails_begin(self, homing, rails):
